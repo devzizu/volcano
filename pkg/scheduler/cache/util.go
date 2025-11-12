@@ -17,6 +17,7 @@ limitations under the License.
 package cache
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"slices"
@@ -24,6 +25,9 @@ import (
 	"strings"
 
 	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 	"stathat.com/c/consistent"
 
@@ -131,4 +135,38 @@ func getHyperNodeEventSource(source string) []string {
 		return nil
 	}
 	return parts
+}
+
+// HasOnlyVolcanoSchedulingGate checks if pod has only the Volcano gate
+func HasOnlyVolcanoSchedulingGate(pod *v1.Pod) bool {
+	return len(pod.Spec.SchedulingGates) == 1 &&
+		pod.Spec.SchedulingGates[0].Name == "volcano.sh/not-ready"
+}
+
+// RemoveVolcanoGate removes the Volcano scheduling gate from a pod via JSON patch
+func RemoveVolcanoGate(kubeClient kubernetes.Interface, pod *v1.Pod) error {
+	// Find the Volcano gate index
+	gateIndex := -1
+	for i, gate := range pod.Spec.SchedulingGates {
+		if gate.Name == "volcano.sh/not-ready" {
+			gateIndex = i
+			break
+		}
+	}
+
+	if gateIndex == -1 {
+		return nil // Gate already removed
+	}
+
+	// Build JSON patch to remove the gate
+	patch := fmt.Sprintf(`[{"op":"remove","path":"/spec/schedulingGates/%d"}]`, gateIndex)
+
+	_, err := kubeClient.CoreV1().Pods(pod.Namespace).Patch(
+		context.TODO(),
+		pod.Name,
+		types.JSONPatchType,
+		[]byte(patch),
+		metav1.PatchOptions{})
+
+	return err
 }

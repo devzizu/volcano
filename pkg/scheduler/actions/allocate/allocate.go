@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
@@ -30,6 +31,7 @@ import (
 
 	"volcano.sh/apis/pkg/apis/scheduling"
 	"volcano.sh/volcano/pkg/scheduler/api"
+	"volcano.sh/volcano/pkg/scheduler/cache"
 	"volcano.sh/volcano/pkg/scheduler/conf"
 	"volcano.sh/volcano/pkg/scheduler/framework"
 	"volcano.sh/volcano/pkg/scheduler/metrics"
@@ -46,27 +48,23 @@ type Action struct {
 	// jobUID -> hyperNodeName -> score
 	hyperNodeScoresByJob map[string]map[string]float64
 
-	kubeClient kubernetes.Interface
-
-	// Async schGate removal routine to avoid blocking scheduler on API calls
-	schGateRemovalRequests chan *schGateRemovalRequest
-	numSchGateWorkers      int
-	schGateShutdownCh      chan struct{}
-	schGateWorkersStarted  bool
+	// Async gate removal infrastructure for failure scenarios
+	gateRemovalCh chan gateRemovalRequest
+	gateRemovalWg sync.WaitGroup
+	shutdownCh    chan struct{}
 }
 
-// schGateRemovalRequest contains pod metadata for async schGate removal
-type schGateRemovalRequest struct {
-	podNamespace string
-	podName      string
-	podUID       types.UID
-	sessionID    types.UID
+type gateRemovalRequest struct {
+	namespace string
+	name      string
 }
 
 func New() *Action {
 	return &Action{
 		enablePredicateErrorCache: true, // default to enable it
 		hyperNodeScoresByJob:      make(map[string]map[string]float64),
+		gateRemovalCh:             make(chan gateRemovalRequest, 1000),
+		shutdownCh:                make(chan struct{}),
 	}
 }
 
@@ -74,42 +72,56 @@ func (alloc *Action) Name() string {
 	return "allocate"
 }
 
-func (alloc *Action) Initialize() {}
-
-// startAsyncSchGateRemovalWorkers initializes background workers for non-blocking schGate removal
-// Called lazily on first Execute() when session is available
-func (alloc *Action) startAsyncSchGateRemovalWorkers(ssn *framework.Session) {
-	alloc.kubeClient = ssn.KubeClient()
-	alloc.numSchGateWorkers = 5 // Tunable based on cluster size
-	alloc.schGateRemovalRequests = make(chan *schGateRemovalRequest, 1000)
-	alloc.schGateShutdownCh = make(chan struct{})
-
-	for i := 0; i < alloc.numSchGateWorkers; i++ {
-		go alloc.processSchGateRemovalRequests(i)
+func (alloc *Action) Initialize() {
+	// Start async gate removal workers
+	numWorkers := 5
+	for i := 0; i < numWorkers; i++ {
+		alloc.gateRemovalWg.Add(1)
+		go alloc.gateRemovalWorker()
 	}
-
-	alloc.schGateWorkersStarted = true
-	klog.V(3).Infof("Started %d async schGate removal workers", alloc.numSchGateWorkers)
+	klog.V(3).Infof("Started %d async gate removal workers", numWorkers)
 }
 
-// processSchGateRemovalRequests runs in background to remove schGates without blocking the scheduler
-func (alloc *Action) processSchGateRemovalRequests(workerID int) {
-	klog.V(4).Infof("SchGate removal worker %d started", workerID)
+func (alloc *Action) UnInitialize() {
+	// Signal workers to shutdown
+	close(alloc.shutdownCh)
+
+	// Wait for all workers to finish
+	alloc.gateRemovalWg.Wait()
+
+	// Close the channel
+	close(alloc.gateRemovalCh)
+
+	klog.V(3).Infof("Async gate removal workers shut down")
+}
+
+// gateRemovalWorker processes async gate removal requests
+func (alloc *Action) gateRemovalWorker() {
+	defer alloc.gateRemovalWg.Done()
 
 	for {
 		select {
-		case req := <-alloc.schGateRemovalRequests:
-			if err := removeVolcanoSchGateFromPodByName(alloc.kubeClient, req.podNamespace, req.podName); err != nil {
-				klog.Errorf("Worker %d failed to remove schGate from %s/%s: %v",
-					workerID, req.podNamespace, req.podName, err)
-			} else {
-				klog.V(3).Infof("Worker %d removed schGate from %s/%s",
-					workerID, req.podNamespace, req.podName)
+		case <-alloc.shutdownCh:
+			klog.V(4).Infof("Gate removal worker shutting down")
+			return
+		case req := <-alloc.gateRemovalCh:
+			// Fetch fresh pod state from API server
+			pod, err := alloc.session.KubeClient().CoreV1().Pods(req.namespace).Get(
+				context.TODO(),
+				req.name,
+				metav1.GetOptions{})
+
+			if err != nil {
+				klog.Errorf("Failed to get pod %s/%s for gate removal: %v", req.namespace, req.name, err)
+				continue
 			}
 
-		case <-alloc.schGateShutdownCh:
-			klog.V(4).Infof("SchGate removal worker %d stopped", workerID)
-			return
+			// Remove the gate
+			if err := cache.RemoveVolcanoGate(alloc.session.KubeClient(), pod); err != nil {
+				klog.Errorf("Failed to remove gate from %s/%s: %v", req.namespace, req.name, err)
+			} else {
+				klog.V(3).Infof("Async removed Volcano gate from pod %s/%s (scheduling failed)", req.namespace, req.name)
+			}
 		}
 	}
 }
@@ -122,11 +134,6 @@ func (alloc *Action) parseArguments(ssn *framework.Session) {
 func (alloc *Action) Execute(ssn *framework.Session) {
 	klog.V(5).Infof("Enter Allocate ...")
 	defer klog.V(5).Infof("Leaving Allocate ...")
-
-	// Lazy initialization - schGate removal workers not started in Initialize()
-	if !alloc.schGateWorkersStarted {
-		alloc.startAsyncSchGateRemovalWorkers(ssn)
-	}
 
 	alloc.parseArguments(ssn)
 
@@ -193,9 +200,6 @@ func (alloc *Action) allocateResources(queues *util.PriorityQueue, jobsMap map[a
 	pendingTasks := map[api.JobID]*util.PriorityQueue{}
 	allNodes := ssn.NodeList
 
-	// Limit one schGate removal per queue per cycle (handles multiple podgroups competing for same queue)
-	schGateRemovalsPerQueue := make(map[api.QueueID]int)
-
 	// To pick <namespace, queue> tuple for job, we choose to pick namespace firstly.
 	// Because we believe that number of queues would less than namespaces in most case.
 	// And, this action would make the resource usage among namespace balanced.
@@ -224,7 +228,7 @@ func (alloc *Action) allocateResources(queues *util.PriorityQueue, jobsMap map[a
 			tasks := util.NewPriorityQueue(ssn.TaskOrderFn)
 			for _, task := range job.TaskStatusIndex[api.Pending] {
 				// Skip tasks with non-Volcano gates (include tasks with only Volcano gate for later removal)
-				if task.SchGated && !hasOnlyVolcanoGate(task.Pod) {
+				if task.SchGated && !cache.HasOnlyVolcanoSchedulingGate(task.Pod) {
 					klog.V(4).Infof("Task %s/%s has non-Volcano gate, skipping", task.Namespace, task.Name)
 					continue
 				}
@@ -258,14 +262,14 @@ func (alloc *Action) allocateResources(queues *util.PriorityQueue, jobsMap map[a
 				klog.ErrorS(nil, "RealNodesList not completely populated and not ready to schedule, please check logs for more details", "job", job.UID)
 				continue
 			}
-			stmt, tasksQueue = alloc.allocateResourceForTasksWithTopology(tasks, job, queue, highestAllowedTier, schGateRemovalsPerQueue)
+			stmt, tasksQueue = alloc.allocateResourceForTasksWithTopology(tasks, job, queue, highestAllowedTier)
 			// There are still left tasks that need to be allocated when min available < replicas, put the job back and set pending tasks.
 			if tasksQueue != nil {
 				jobs.Push(job)
 				pendingTasks[job.UID] = tasksQueue
 			}
 		} else {
-			stmt = alloc.allocateResourcesForTasks(tasks, job, queue, allNodes, "", schGateRemovalsPerQueue)
+			stmt = alloc.allocateResourcesForTasks(tasks, job, queue, allNodes, "")
 			// There are still left tasks that need to be allocated when min available < replicas, put the job back
 			if tasks.Len() > 0 {
 				jobs.Push(job)
@@ -282,13 +286,28 @@ func (alloc *Action) allocateResources(queues *util.PriorityQueue, jobsMap map[a
 	}
 }
 
-// hasOnlyVolcanoGate returns true if pod has only the Volcano gate (no other gates)
-func hasOnlyVolcanoGate(pod *v1.Pod) bool {
-	return len(pod.Spec.SchedulingGates) == 1 &&
-		pod.Spec.SchedulingGates[0].Name == "volcano.sh/not-ready"
+// tryRemoveGateOnFailure queues async gate removal if scheduling failed
+// This ensures CA can see the Unschedulable condition and trigger scale-up
+func (alloc *Action) tryRemoveGateOnFailure(task *api.TaskInfo) {
+	if task.RemoveGateDuringBind && cache.HasOnlyVolcanoSchedulingGate(task.Pod) {
+		req := gateRemovalRequest{
+			namespace: task.Namespace,
+			name:      task.Name,
+		}
+
+		select {
+		case alloc.gateRemovalCh <- req:
+			klog.V(4).Infof("Queued gate removal for %s/%s (scheduling failed)", task.Namespace, task.Name)
+			// Update task state immediately so it won't be queued again
+			task.SchGated = false
+			task.RemoveGateDuringBind = false
+		default:
+			klog.Warningf("Gate removal queue full, skipping %s/%s", task.Namespace, task.Name)
+		}
+	}
 }
 
-func (alloc *Action) allocateResourceForTasksWithTopology(tasks *util.PriorityQueue, job *api.JobInfo, queue *api.QueueInfo, highestAllowedTier int, schGateRemovalsPerQueue map[api.QueueID]int) (*framework.Statement, *util.PriorityQueue) {
+func (alloc *Action) allocateResourceForTasksWithTopology(tasks *util.PriorityQueue, job *api.JobInfo, queue *api.QueueInfo, highestAllowedTier int) (*framework.Statement, *util.PriorityQueue) {
 	jobStmtsByTier := make(map[int]map[string]*framework.Statement)
 	hyperNodesWithLeftTasks := make(map[string]*util.PriorityQueue)
 	ssn := alloc.session
@@ -331,7 +350,7 @@ func (alloc *Action) allocateResourceForTasksWithTopology(tasks *util.PriorityQu
 			tasksQueue := tasks.Clone()
 			job.ResetFitErr()
 			klog.V(3).InfoS("Try to allocate resource for job in hyperNode", "jobName", job.UID, "hyperNodeName", hyperNodeName, "tier", tier)
-			stmt := alloc.allocateResourcesForTasks(tasksQueue, job, queue, nodes, hyperNodeName, schGateRemovalsPerQueue)
+			stmt := alloc.allocateResourcesForTasks(tasksQueue, job, queue, nodes, hyperNodeName)
 			if stmt == nil {
 				klog.V(4).InfoS("Cannot allocate resources for job with network topology constrains", "jobName", job.UID, "hyperNodeName", hyperNodeName, "tier", tier)
 				continue
@@ -427,7 +446,7 @@ func (alloc *Action) selectBestHyperNode(jobStmts map[string]*framework.Statemen
 	return finalStmt, bestHyperNodeName
 }
 
-func (alloc *Action) allocateResourcesForTasks(tasks *util.PriorityQueue, job *api.JobInfo, queue *api.QueueInfo, allNodes []*api.NodeInfo, hyperNode string, schGateRemovalsPerQueue map[api.QueueID]int) *framework.Statement {
+func (alloc *Action) allocateResourcesForTasks(tasks *util.PriorityQueue, job *api.JobInfo, queue *api.QueueInfo, allNodes []*api.NodeInfo, hyperNode string) *framework.Statement {
 	ssn := alloc.session
 	stmt := framework.NewStatement(ssn)
 	ph := util.NewPredicateHelper()
@@ -441,34 +460,18 @@ func (alloc *Action) allocateResourcesForTasks(tasks *util.PriorityQueue, job *a
 			continue
 		}
 
-		// Queue has capacity - remove schGate asynchronously (one per queue per cycle)
-		if task.SchGated && hasOnlyVolcanoGate(task.Pod) {
-			// Limit to one schGate removal per queue per cycle to handle multiple podgroups competing
-			if schGateRemovalsPerQueue[queue.UID] > 0 {
-				klog.V(4).Infof("Already queued schGate removal for queue <%s>, skipping %s/%s",
-					queue.Name, task.Namespace, task.Name)
-				continue
-			}
+		// Queue has capacity - mark task for gate removal during bind
+		if task.SchGated && cache.HasOnlyVolcanoSchedulingGate(task.Pod) {
+			// Mark task to have gate removed atomically during bind
+			task.RemoveGateDuringBind = true
+			klog.V(3).Infof("Task %s/%s will have gate removed during bind (queue %s has capacity)",
+				task.Namespace, task.Name, queue.Name)
+			// Don't continue - proceed with allocation
+		}
 
-			// Queue schGate removal request asynchronously
-			req := &schGateRemovalRequest{
-				podNamespace: task.Namespace,
-				podName:      task.Name,
-				podUID:       types.UID(task.Pod.UID),
-				sessionID:    ssn.UID,
-			}
-
-			select {
-			case alloc.schGateRemovalRequests <- req:
-				klog.V(3).Infof("Queued schGate removal for %s/%s (queue %s has capacity)",
-					task.Namespace, task.Name, queue.Name)
-				schGateRemovalsPerQueue[queue.UID]++
-			default:
-				klog.Warningf("SchGate removal queue full (capacity %d), skipping %s/%s",
-					cap(alloc.schGateRemovalRequests), task.Namespace, task.Name)
-			}
-
-			// Wait for schGate removal to complete before allocating
+		// Skip tasks with external (non-Volcano) gates
+		if task.SchGated && !task.RemoveGateDuringBind {
+			klog.V(4).Infof("Task %s/%s has non-Volcano gate, skipping", task.Namespace, task.Name)
 			continue
 		}
 
@@ -487,6 +490,7 @@ func (alloc *Action) allocateResourcesForTasks(tasks *util.PriorityQueue, job *a
 				fitErrors.SetNodeError(ni.Name, err)
 			}
 			job.NodesFitErrors[task.UID] = fitErrors
+			alloc.tryRemoveGateOnFailure(task)
 			break
 		}
 
@@ -514,6 +518,8 @@ func (alloc *Action) allocateResourcesForTasks(tasks *util.PriorityQueue, job *a
 			// the original node is no longer usable for other reasons. Other nodes are not usable either because of the allocated claim.
 			// The DRA scheduler plugin detects that and then when scheduling fails (= no node passed filtering), it recovers by de-allocating the allocated claim in PostFilter.
 			job.NodesFitErrors[task.UID] = fitErrors
+			alloc.tryRemoveGateOnFailure(task)
+
 			// Assume that all left tasks are allocatable, but can not meet gang-scheduling min member,
 			// so we should break from continuously allocating.
 			// otherwise, should continue to find other allocatable task
@@ -529,6 +535,8 @@ func (alloc *Action) allocateResourcesForTasks(tasks *util.PriorityQueue, job *a
 		}
 		bestNode, highestScore := alloc.prioritizeNodes(ssn, task, predicateNodes)
 		if bestNode == nil {
+			klog.V(3).Infof("No best node found for task %s/%s after prioritization", task.Namespace, task.Name)
+			alloc.tryRemoveGateOnFailure(task)
 			continue
 		}
 
@@ -743,28 +751,4 @@ func (alloc *Action) predicate(task *api.TaskInfo, node *api.NodeInfo) error {
 		return api.NewFitErrWithStatus(task, node, statusSets...)
 	}
 	return alloc.session.PredicateForAllocateAction(task, node)
-}
-
-func (alloc *Action) UnInitialize() {
-	if !alloc.schGateWorkersStarted {
-		return
-	}
-
-	// Stop workers
-	close(alloc.schGateShutdownCh)
-
-	// Drain remaining requests (best effort)
-	remaining := len(alloc.schGateRemovalRequests)
-	if remaining > 0 {
-		klog.V(3).Infof("Draining %d remaining schGate removal requests", remaining)
-		close(alloc.schGateRemovalRequests)
-		for req := range alloc.schGateRemovalRequests {
-			if err := removeVolcanoSchGateFromPodByName(alloc.kubeClient, req.podNamespace, req.podName); err != nil {
-				klog.Warningf("Failed to remove schGate during cleanup for %s/%s: %v",
-					req.podNamespace, req.podName, err)
-			}
-		}
-	}
-
-	klog.V(3).Infof("SchGate removal workers stopped")
 }
