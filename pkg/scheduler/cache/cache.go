@@ -1549,6 +1549,12 @@ func (sc *SchedulerCache) RecordJobStatusEvent(job *schedulingapi.JobInfo, updat
 				return
 			}
 
+			if hasVolcanoSchedulingGate(taskInfo.Pod) {
+				klog.V(5).Infof("Task %s/%s has Volcano scheduling gate, skipping unschedulable update",
+					taskInfo.Namespace, taskInfo.Name)
+				return
+			}
+
 			reason, msg, nominatedNodeName := job.TaskSchedulingReason(taskInfo.UID)
 			if len(msg) == 0 {
 				msg = baseErrorMessage
@@ -1560,6 +1566,15 @@ func (sc *SchedulerCache) RecordJobStatusEvent(job *schedulingapi.JobInfo, updat
 			}
 		})
 	}
+}
+
+func hasVolcanoSchedulingGate(pod *v1.Pod) bool {
+	for _, gate := range pod.Spec.SchedulingGates {
+		if gate.Name == "volcano.sh/not-ready" {
+			return true
+		}
+	}
+	return false
 }
 
 // UpdateJobStatus update the status of job and its tasks.
