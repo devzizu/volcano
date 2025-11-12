@@ -48,13 +48,21 @@ type Action struct {
 	// jobUID -> hyperNodeName -> score
 	hyperNodeScoresByJob map[string]map[string]float64
 
-	// Async gate removal infrastructure for failure scenarios
-	gateRemovalCh chan gateRemovalRequest
-	gateRemovalWg sync.WaitGroup
-	shutdownCh    chan struct{}
+	// Async gate management infrastructure
+	schGateOperationCh chan schGateOperation
+	schGateWorkersWg   sync.WaitGroup
+	schGateShutdownCh  chan struct{}
 }
 
-type gateRemovalRequest struct {
+type schGateOperationType string
+
+const (
+	schGateOperationAdd    schGateOperationType = "add"
+	schGateOperationRemove schGateOperationType = "remove"
+)
+
+type schGateOperation struct {
+	opType    schGateOperationType
 	namespace string
 	name      string
 }
@@ -63,8 +71,8 @@ func New() *Action {
 	return &Action{
 		enablePredicateErrorCache: true, // default to enable it
 		hyperNodeScoresByJob:      make(map[string]map[string]float64),
-		gateRemovalCh:             make(chan gateRemovalRequest, 1000),
-		shutdownCh:                make(chan struct{}),
+		schGateOperationCh:        make(chan schGateOperation, 1000),
+		schGateShutdownCh:         make(chan struct{}),
 	}
 }
 
@@ -73,54 +81,65 @@ func (alloc *Action) Name() string {
 }
 
 func (alloc *Action) Initialize() {
-	// Start async gate removal workers
+	// Start async gate operation workers
 	numWorkers := 5
 	for i := 0; i < numWorkers; i++ {
-		alloc.gateRemovalWg.Add(1)
-		go alloc.gateRemovalWorker()
+		alloc.schGateWorkersWg.Add(1)
+		go alloc.schGateOperationWorker()
 	}
-	klog.V(3).Infof("Started %d async gate removal workers", numWorkers)
+	klog.V(3).Infof("Started %d async gate operation workers", numWorkers)
 }
 
 func (alloc *Action) UnInitialize() {
 	// Signal workers to shutdown
-	close(alloc.shutdownCh)
+	close(alloc.schGateShutdownCh)
 
 	// Wait for all workers to finish
-	alloc.gateRemovalWg.Wait()
+	alloc.schGateWorkersWg.Wait()
 
 	// Close the channel
-	close(alloc.gateRemovalCh)
+	close(alloc.schGateOperationCh)
 
-	klog.V(3).Infof("Async gate removal workers shut down")
+	klog.V(3).Infof("Async gate operation workers shut down")
 }
 
-// gateRemovalWorker processes async gate removal requests
-func (alloc *Action) gateRemovalWorker() {
-	defer alloc.gateRemovalWg.Done()
+// schGateOperationWorker processes async gate add/remove requests
+func (alloc *Action) schGateOperationWorker() {
+	defer alloc.schGateWorkersWg.Done()
 
 	for {
 		select {
-		case <-alloc.shutdownCh:
-			klog.V(4).Infof("Gate removal worker shutting down")
+		case <-alloc.schGateShutdownCh:
+			klog.V(4).Infof("Scheduling gate operation worker shutting down")
 			return
-		case req := <-alloc.gateRemovalCh:
+		case op := <-alloc.schGateOperationCh:
 			// Fetch fresh pod state from API server
-			pod, err := alloc.session.KubeClient().CoreV1().Pods(req.namespace).Get(
+			pod, err := alloc.session.KubeClient().CoreV1().Pods(op.namespace).Get(
 				context.TODO(),
-				req.name,
+				op.name,
 				metav1.GetOptions{})
 
 			if err != nil {
-				klog.Errorf("Failed to get pod %s/%s for gate removal: %v", req.namespace, req.name, err)
+				klog.Errorf("Failed to get pod %s/%s for gate operation: %v", op.namespace, op.name, err)
 				continue
 			}
 
-			// Remove the gate
-			if err := cache.RemoveVolcanoGate(alloc.session.KubeClient(), pod); err != nil {
-				klog.Errorf("Failed to remove gate from %s/%s: %v", req.namespace, req.name, err)
-			} else {
-				klog.V(3).Infof("Async removed Volcano gate from pod %s/%s (scheduling failed)", req.namespace, req.name)
+			// Perform the operation
+			switch op.opType {
+			case schGateOperationRemove:
+				if err := cache.RemoveVolcanoSchGate(alloc.session.KubeClient(), pod); err != nil {
+					klog.Errorf("Failed to remove gate from %s/%s: %v", op.namespace, op.name, err)
+				} else {
+					klog.V(3).Infof("Removed Volcano scheduling gate from pod %s/%s", op.namespace, op.name)
+				}
+			case schGateOperationAdd:
+				if err := cache.AddVolcanoSchGate(alloc.session.KubeClient(), pod); err != nil {
+					klog.Errorf("Failed to add gate to %s/%s: %v", op.namespace, op.name, err)
+				} else {
+					klog.V(3).Infof("Added Volcano scheduling gate to pod %s/%s", op.namespace, op.name)
+				}
+			default:
+				klog.Errorf("Unknown gate operation type: %s for pod %s/%s", op.opType, op.namespace, op.name)
 			}
 		}
 	}
@@ -286,23 +305,48 @@ func (alloc *Action) allocateResources(queues *util.PriorityQueue, jobsMap map[a
 	}
 }
 
-// tryRemoveGateOnFailure queues async gate removal if scheduling failed
+// enqueueSchedulingGateRemoval queues async gate removal if scheduling failed
 // This ensures CA can see the Unschedulable condition and trigger scale-up
-func (alloc *Action) tryRemoveGateOnFailure(task *api.TaskInfo) {
-	if task.RemoveGateDuringBind && cache.HasOnlyVolcanoSchedulingGate(task.Pod) {
-		req := gateRemovalRequest{
+func (alloc *Action) enqueueSchedulingGateRemoval(task *api.TaskInfo) {
+	// Only enqueue gate removal if the task has only Volcano scheduling gate
+	if cache.HasOnlyVolcanoSchedulingGate(task.Pod) {
+		op := schGateOperation{
+			opType:    schGateOperationRemove,
 			namespace: task.Namespace,
 			name:      task.Name,
 		}
 
 		select {
-		case alloc.gateRemovalCh <- req:
+		case alloc.schGateOperationCh <- op:
 			klog.V(4).Infof("Queued gate removal for %s/%s (scheduling failed)", task.Namespace, task.Name)
 			// Update task state immediately so it won't be queued again
 			task.SchGated = false
 			task.RemoveGateDuringBind = false
 		default:
-			klog.Warningf("Gate removal queue full, skipping %s/%s", task.Namespace, task.Name)
+			klog.Warningf("Gate operation queue full, skipping gate removal for %s/%s", task.Namespace, task.Name)
+		}
+	}
+}
+
+// enqueueSchedulingGateAddition queues async gate re-addition when queue becomes unavailable
+// This hides the pod from CA when it can't be scheduled due to queue limits
+func (alloc *Action) enqueueSchedulingGateAddition(task *api.TaskInfo) {
+	// Only enqueue gate addition if the task doesn't have the Volcano scheduling gate
+	if !task.SchGated && !cache.HasOnlyVolcanoSchedulingGate(task.Pod) {
+		op := schGateOperation{
+			opType:    schGateOperationAdd,
+			namespace: task.Namespace,
+			name:      task.Name,
+		}
+
+		select {
+		case alloc.schGateOperationCh <- op:
+			klog.V(4).Infof("Queued gate re-addition for %s/%s (queue no longer has capacity)", task.Namespace, task.Name)
+			// Mark as gated in cache immediately
+			task.SchGated = true
+			task.RemoveGateDuringBind = false
+		default:
+			klog.Warningf("Gate operation queue full, skipping gate re-addition for %s/%s", task.Namespace, task.Name)
 		}
 	}
 }
@@ -455,10 +499,17 @@ func (alloc *Action) allocateResourcesForTasks(tasks *util.PriorityQueue, job *a
 
 	for !tasks.Empty() {
 		task := tasks.Pop().(*api.TaskInfo)
+		klog.V(3).Infof("[DEBUG] Processing task %s/%s: SchGated=%v, RemoveGateDuringBind=%v",
+			task.Namespace, task.Name, task.SchGated, task.RemoveGateDuringBind)
+
 		if !ssn.Allocatable(queue, task) {
 			klog.V(3).Infof("Queue <%s> is overused when considering task <%s>, ignore it.", queue.Name, task.Name)
+			// If gate was previously removed but queue no longer has capacity, re-add it
+			alloc.enqueueSchedulingGateAddition(task)
 			continue
 		}
+
+		klog.V(3).Infof("[DEBUG] Task %s/%s passed Allocatable check", task.Namespace, task.Name)
 
 		// Queue has capacity - mark task for gate removal during bind
 		if task.SchGated && cache.HasOnlyVolcanoSchedulingGate(task.Pod) {
@@ -466,14 +517,16 @@ func (alloc *Action) allocateResourcesForTasks(tasks *util.PriorityQueue, job *a
 			task.RemoveGateDuringBind = true
 			klog.V(3).Infof("Task %s/%s will have gate removed during bind (queue %s has capacity)",
 				task.Namespace, task.Name, queue.Name)
-			// Don't continue - proceed with allocation
 		}
 
-		// Skip tasks with external (non-Volcano) gates
+		// Skip tasks with external (non-Volcano) scheduling gates
 		if task.SchGated && !task.RemoveGateDuringBind {
-			klog.V(4).Infof("Task %s/%s has non-Volcano gate, skipping", task.Namespace, task.Name)
+			klog.V(3).Infof("[DEBUG] Task %s/%s has non-Volcano gate, skipping (SchGated=%v, RemoveGateDuringBind=%v)",
+				task.Namespace, task.Name, task.SchGated, task.RemoveGateDuringBind)
 			continue
 		}
+
+		klog.V(3).Infof("[DEBUG] Task %s/%s passed gate checks, proceeding to scheduling", task.Namespace, task.Name)
 
 		// check if the task with its spec has already predicates failed
 		if job.TaskHasFitErrors(task) {
@@ -490,7 +543,12 @@ func (alloc *Action) allocateResourcesForTasks(tasks *util.PriorityQueue, job *a
 				fitErrors.SetNodeError(ni.Name, err)
 			}
 			job.NodesFitErrors[task.UID] = fitErrors
-			alloc.tryRemoveGateOnFailure(task)
+
+			// PrePredicate failed, enqueue gate removal
+			// Unschedulable will be set in the Pod Status reason
+			alloc.enqueueSchedulingGateRemoval(task)
+
+			// PrePredicate failed, break from continuously allocating
 			break
 		}
 
@@ -518,7 +576,10 @@ func (alloc *Action) allocateResourcesForTasks(tasks *util.PriorityQueue, job *a
 			// the original node is no longer usable for other reasons. Other nodes are not usable either because of the allocated claim.
 			// The DRA scheduler plugin detects that and then when scheduling fails (= no node passed filtering), it recovers by de-allocating the allocated claim in PostFilter.
 			job.NodesFitErrors[task.UID] = fitErrors
-			alloc.tryRemoveGateOnFailure(task)
+
+			// No predicate nodes found, enqueue gate removal
+			// Unschedulable will be set in the Pod Status reason
+			alloc.enqueueSchedulingGateRemoval(task)
 
 			// Assume that all left tasks are allocatable, but can not meet gang-scheduling min member,
 			// so we should break from continuously allocating.
@@ -536,7 +597,11 @@ func (alloc *Action) allocateResourcesForTasks(tasks *util.PriorityQueue, job *a
 		bestNode, highestScore := alloc.prioritizeNodes(ssn, task, predicateNodes)
 		if bestNode == nil {
 			klog.V(3).Infof("No best node found for task %s/%s after prioritization", task.Namespace, task.Name)
-			alloc.tryRemoveGateOnFailure(task)
+
+			// No best node found after prioritization, enqueue gate removal
+			// Unschedulable will be set in the Pod Status reason
+			alloc.enqueueSchedulingGateRemoval(task)
+
 			continue
 		}
 
@@ -565,7 +630,7 @@ func (alloc *Action) allocateResourcesForTasks(tasks *util.PriorityQueue, job *a
 
 // removeVolcanoSchGateFromPodByName removes the Volcano schGate from a pod using JSON Patch
 func removeVolcanoSchGateFromPodByName(kubeClient kubernetes.Interface, namespace, name string) error {
-	const volcanoSchGate = "volcano.sh/not-ready"
+	const volcanoSchGate = "volcano.sh/queue-allocation-gate"
 
 	pod, err := kubeClient.CoreV1().Pods(namespace).Get(context.TODO(), name, metav1.GetOptions{})
 	if err != nil {

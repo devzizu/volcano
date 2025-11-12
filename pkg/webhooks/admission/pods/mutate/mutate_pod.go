@@ -173,7 +173,7 @@ func patchSchedulingGates(pod *v1.Pod) *patchOperation {
 	}
 
 	gates := []v1.PodSchedulingGate{
-		{Name: "volcano.sh/not-ready"},
+		{Name: "volcano.sh/queue-allocation-gate"},
 	}
 
 	klog.V(3).Infof("Adding Volcano scheduling gate to pod %s/%s", pod.Namespace, pod.Name)

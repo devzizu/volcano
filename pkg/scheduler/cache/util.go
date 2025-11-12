@@ -140,15 +140,15 @@ func getHyperNodeEventSource(source string) []string {
 // HasOnlyVolcanoSchedulingGate checks if pod has only the Volcano gate
 func HasOnlyVolcanoSchedulingGate(pod *v1.Pod) bool {
 	return len(pod.Spec.SchedulingGates) == 1 &&
-		pod.Spec.SchedulingGates[0].Name == "volcano.sh/not-ready"
+		pod.Spec.SchedulingGates[0].Name == "volcano.sh/queue-allocation-gate"
 }
 
 // RemoveVolcanoGate removes the Volcano scheduling gate from a pod via JSON patch
-func RemoveVolcanoGate(kubeClient kubernetes.Interface, pod *v1.Pod) error {
+func RemoveVolcanoSchGate(kubeClient kubernetes.Interface, pod *v1.Pod) error {
 	// Find the Volcano gate index
 	gateIndex := -1
 	for i, gate := range pod.Spec.SchedulingGates {
-		if gate.Name == "volcano.sh/not-ready" {
+		if gate.Name == "volcano.sh/queue-allocation-gate" {
 			gateIndex = i
 			break
 		}
@@ -160,6 +160,35 @@ func RemoveVolcanoGate(kubeClient kubernetes.Interface, pod *v1.Pod) error {
 
 	// Build JSON patch to remove the gate
 	patch := fmt.Sprintf(`[{"op":"remove","path":"/spec/schedulingGates/%d"}]`, gateIndex)
+
+	_, err := kubeClient.CoreV1().Pods(pod.Namespace).Patch(
+		context.TODO(),
+		pod.Name,
+		types.JSONPatchType,
+		[]byte(patch),
+		metav1.PatchOptions{})
+
+	return err
+}
+
+// AddVolcanoSchGate adds the Volcano scheduling gate to a pod via JSON patch
+func AddVolcanoSchGate(kubeClient kubernetes.Interface, pod *v1.Pod) error {
+	// Check if gate already exists
+	for _, gate := range pod.Spec.SchedulingGates {
+		if gate.Name == "volcano.sh/queue-allocation-gate" {
+			return nil // Gate already present
+		}
+	}
+
+	// Build JSON patch to add the gate
+	var patch string
+	if len(pod.Spec.SchedulingGates) == 0 {
+		// No gates exist, create the array
+		patch = `[{"op":"add","path":"/spec/schedulingGates","value":[{"name":"volcano.sh/queue-allocation-gate"}]}]`
+	} else {
+		// Gates exist, append to array
+		patch = `[{"op":"add","path":"/spec/schedulingGates/-","value":{"name":"volcano.sh/queue-allocation-gate"}}]`
+	}
 
 	_, err := kubeClient.CoreV1().Pods(pod.Namespace).Patch(
 		context.TODO(),
