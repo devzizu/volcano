@@ -52,6 +52,8 @@ type Action struct {
 	schGateOperationCh chan schGateOperation
 	schGateWorkersWg   sync.WaitGroup
 	schGateShutdownCh  chan struct{}
+
+	startedWorkers bool
 }
 
 type schGateOperationType string
@@ -85,6 +87,7 @@ func (alloc *Action) Initialize() {
 	numWorkers := 5
 	for i := 0; i < numWorkers; i++ {
 		alloc.schGateWorkersWg.Add(1)
+		klog.V(3).Infof("Starting async gate operation worker %d", i)
 		go alloc.schGateOperationWorker()
 	}
 	klog.V(3).Infof("Started %d async gate operation workers", numWorkers)
@@ -153,6 +156,11 @@ func (alloc *Action) parseArguments(ssn *framework.Session) {
 func (alloc *Action) Execute(ssn *framework.Session) {
 	klog.V(5).Infof("Enter Allocate ...")
 	defer klog.V(5).Infof("Leaving Allocate ...")
+
+	if !alloc.startedWorkers {
+		alloc.startedWorkers = true
+		alloc.Initialize()
+	}
 
 	alloc.parseArguments(ssn)
 
@@ -502,10 +510,21 @@ func (alloc *Action) allocateResourcesForTasks(tasks *util.PriorityQueue, job *a
 		klog.V(3).Infof("[DEBUG] Processing task %s/%s: SchGated=%v, RemoveGateDuringBind=%v",
 			task.Namespace, task.Name, task.SchGated, task.RemoveGateDuringBind)
 
-		if !ssn.Allocatable(queue, task) {
+		// Sync SchGated with actual pod state for accurate capacity accounting
+		// The async gate removal/addition may have changed the pod's gates, but cache is stale
+		task.SchGated = len(task.Pod.Spec.SchedulingGates) > 0
+
+		unschedulable := false
+
+		if len(task.Pod.Status.Conditions) > 0 && task.Pod.Status.Conditions[0].Type == v1.PodScheduled && task.Pod.Status.Conditions[0].Status == v1.ConditionFalse && task.Pod.Status.Conditions[0].Reason == "Unschedulable" {
+			klog.V(3).Infof("Task %s/%s has unschedulable state condition, SchGated=%v", task.Namespace, task.Name, task.SchGated)
+			unschedulable = true
+		}
+
+		if !unschedulable && !ssn.Allocatable(queue, task) {
 			klog.V(3).Infof("Queue <%s> is overused when considering task <%s>, ignore it.", queue.Name, task.Name)
 			// If gate was previously removed but queue no longer has capacity, re-add it
-			alloc.enqueueSchedulingGateAddition(task)
+			// alloc.enqueueSchedulingGateAddition(task)
 			continue
 		}
 

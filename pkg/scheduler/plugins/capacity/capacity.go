@@ -419,6 +419,10 @@ func (cp *capacityPlugin) buildQueueAttrs(ssn *framework.Session) {
 				}
 			} else if status == api.Pending {
 				for _, t := range tasks {
+					if !t.SchGated {
+						klog.V(4).Infof("Accounting for ungated task <%s/%s> in queue <%s>", t.Namespace, t.Name, attr.name)
+						attr.allocated.Add(t.Resreq)
+					}
 					attr.request.Add(t.Resreq)
 				}
 			}
@@ -554,6 +558,12 @@ func (cp *capacityPlugin) buildHierarchicalQueueAttrs(ssn *framework.Session) bo
 				}
 			} else if status == api.Pending {
 				for _, t := range tasks {
+					if !t.SchGated {
+						attr.allocated.Add(t.Resreq)
+						klog.V(4).Infof("Accounting for ungated task <%s/%s> in queue <%s>", t.Namespace, t.Name, attr.name)
+					}
+
+					klog.V(4).Infof("Not accounting for gated task <%s/%s> in queue <%s>", t.Namespace, t.Name, attr.name)
 					attr.request.Add(t.Resreq)
 				}
 			}
