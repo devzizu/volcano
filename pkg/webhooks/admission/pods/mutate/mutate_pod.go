@@ -154,7 +154,7 @@ func createPatch(pod *v1.Pod) ([]byte, error) {
 // determines it's ready (queue admission + gang scheduling satisfied)
 func patchSchedulingGates(pod *v1.Pod) *patchOperation {
 	// Check if opt-in annotation is present
-	if pod.Annotations == nil || pod.Annotations["volcano.sh/enable-scheduling-gates"] != "true" {
+	if pod.Annotations == nil || pod.Annotations["volcano.sh/queue-allocation-gate"] != "true" {
 		return nil
 	}
 
@@ -181,7 +181,7 @@ func patchSchedulingGates(pod *v1.Pod) *patchOperation {
 	return &patchOperation{
 		Op:    "add",
 		Path:  "/spec/schedulingGates",
-		Value: gates,
+		Value: append(pod.Spec.SchedulingGates, gates...),
 	}
 }
 

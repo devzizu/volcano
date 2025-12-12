@@ -214,7 +214,7 @@ func (db *DefaultBinder) Bind(kubeClient kubernetes.Interface, tasks []*scheduli
 		p := task.Pod
 
 		// Remove Volcano gate before bind if needed
-		if task.RemoveGateDuringBind && HasOnlyVolcanoSchedulingGate(p) {
+		if task.RemoveGateDuringBind {
 			if err := RemoveVolcanoSchGate(kubeClient, p); err != nil {
 				klog.Errorf("Failed to remove gate for <%v/%v>: %v", p.Namespace, p.Name, err)
 				errMsg[task.UID] = fmt.Sprintf("gate removal failed: %v", err)
