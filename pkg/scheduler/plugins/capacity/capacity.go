@@ -29,6 +29,7 @@ import (
 
 	"volcano.sh/volcano/pkg/scheduler/api"
 	"volcano.sh/volcano/pkg/scheduler/api/helpers"
+	"volcano.sh/volcano/pkg/scheduler/cache"
 	"volcano.sh/volcano/pkg/scheduler/framework"
 	"volcano.sh/volcano/pkg/scheduler/metrics"
 	"volcano.sh/volcano/pkg/scheduler/plugins/util"
@@ -52,6 +53,10 @@ type capacityPlugin struct {
 	queueOpts map[api.QueueID]*queueAttr
 	// Arguments given for the plugin
 	pluginArguments framework.Arguments
+	// session reference for dynamic reserved calculation
+	session *framework.Session
+	// cache of reserved resources per queue (invalidated when task state changes)
+	reservedCache map[api.QueueID]*api.Resource
 }
 
 type queueAttr struct {
@@ -90,6 +95,8 @@ func (cp *capacityPlugin) Name() string {
 
 func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 	// Prepare scheduling data for this session.
+	cp.session = ssn
+	cp.reservedCache = make(map[api.QueueID]*api.Resource)
 	cp.totalResource.Add(ssn.TotalResource)
 
 	klog.V(4).Infof("The total resource is <%v>", cp.totalResource)
@@ -299,7 +306,7 @@ func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 
 		simulateQueueAllocatable := func(state *capacityState, queue *api.QueueInfo, candidate *api.TaskInfo) bool {
 			attr := state.queueAttrs[queue.UID]
-			return queueAllocatable(attr, candidate, queue)
+			return cp.queueAllocatableWithReserved(attr, candidate, queue)
 		}
 
 		list := append(state.queueAttrs[queue.UID].ancestors, queue.UID)
@@ -359,6 +366,8 @@ func (cp *capacityPlugin) OnSessionClose(ssn *framework.Session) {
 	cp.totalResource = nil
 	cp.totalGuarantee = nil
 	cp.queueOpts = nil
+	cp.session = nil
+	cp.reservedCache = nil
 }
 
 func (cp *capacityPlugin) buildQueueAttrs(ssn *framework.Session) {
@@ -846,15 +855,58 @@ func (cp *capacityPlugin) isLeafQueue(queueID api.QueueID) bool {
 
 func (cp *capacityPlugin) queueAllocatable(queue *api.QueueInfo, candidate *api.TaskInfo) bool {
 	attr := cp.queueOpts[queue.UID]
-	return queueAllocatable(attr, candidate, queue)
+	return cp.queueAllocatableWithReserved(attr, candidate, queue)
 }
 
-func queueAllocatable(attr *queueAttr, candidate *api.TaskInfo, queue *api.QueueInfo) bool {
-	futureUsed := attr.allocated.Clone().Add(candidate.Resreq)
+// InvalidateReservedCache clears the reserved cache for a specific queue
+// This should be called when a task's SchGated state changes during a cycle
+func (cp *capacityPlugin) InvalidateReservedCache(queueID api.QueueID) {
+	delete(cp.reservedCache, queueID)
+	klog.V(4).Infof("Invalidated reserved cache for queue <%s>", queueID)
+}
+
+func (cp *capacityPlugin) queueAllocatableWithReserved(attr *queueAttr, candidate *api.TaskInfo, queue *api.QueueInfo) bool {
+	// Check if we have a cached value for this queue
+	reserved, cached := cp.reservedCache[queue.UID]
+	if !cached {
+		// Calculate reserved resources (ungated Pending pods that couldn't be scheduled)
+		reserved = api.EmptyResource()
+		for _, job := range cp.session.Jobs {
+			// Only check jobs in this queue
+			if job.Queue != queue.UID {
+				continue
+			}
+			for _, task := range job.Tasks {
+				// Count ungated Pending pods with queue allocation gate annotation
+				if !task.SchGated && task.Status == api.Pending &&
+					cache.HasQueueAllocationGateAnnotation(task.Pod) {
+					reserved.Add(task.Resreq)
+				}
+			}
+		}
+
+		// Cache the result for this queue
+		cp.reservedCache[queue.UID] = reserved
+	}
+
+	// Exclude candidate from reserved if it's already counted (avoid double-counting)
+	adjustedReserved := reserved.Clone()
+	if !candidate.SchGated && candidate.Status == api.Pending &&
+		cache.HasQueueAllocationGateAnnotation(candidate.Pod) &&
+		!adjustedReserved.LessEqual(candidate.Resreq, api.Zero) {
+		// Candidate was counted in reserved, subtract it to avoid double-counting in futureUsed
+		adjustedReserved.Sub(candidate.Resreq)
+		klog.V(4).Infof("Excluding candidate %s/%s from reserved for capacity check",
+			candidate.Namespace, candidate.Name)
+	}
+
+	// Include reserved resources in capacity check
+	futureUsed := attr.allocated.Clone().Add(adjustedReserved).Add(candidate.Resreq)
 	allocatable, _ := futureUsed.LessEqualWithDimensionAndResourcesName(attr.realCapability, candidate.Resreq)
+
 	if !allocatable {
-		klog.V(3).Infof("Queue <%v>: realCapability <%v>, allocated <%v>; Candidate <%v>: resource request <%v>",
-			queue.Name, attr.realCapability, attr.allocated, candidate.Name, candidate.Resreq)
+		klog.V(3).Infof("Queue <%v>: capacity exceeded - realCapability <%v>, allocated <%v>, reserved <%v>, candidate <%v> req <%v>",
+			queue.Name, attr.realCapability, attr.allocated, adjustedReserved, candidate.Name, candidate.Resreq)
 	}
 
 	return allocatable

@@ -682,6 +682,21 @@ func (ssn *Session) GetCycleState(taskID api.TaskID) *k8sframework.CycleState {
 	return obj.(*k8sframework.CycleState)
 }
 
+// InvalidateCapacityReservedCache invalidates the capacity plugin's reserved cache for a specific queue
+// This should be called when a task's SchGated state changes during a cycle
+func (ssn *Session) InvalidateCapacityReservedCache(queueID api.QueueID) {
+	// Find the capacity plugin and call its invalidation method
+	if plugin, found := ssn.plugins["capacity"]; found {
+		// Type assert to access the InvalidateReservedCache method
+		type cacheInvalidator interface {
+			InvalidateReservedCache(queueID api.QueueID)
+		}
+		if ci, ok := plugin.(cacheInvalidator); ok {
+			ci.InvalidateReservedCache(queueID)
+		}
+	}
+}
+
 // Evict the task in the session
 func (ssn *Session) Evict(reclaimee *api.TaskInfo, reason string) error {
 	if err := ssn.cache.Evict(reclaimee, reason); err != nil {

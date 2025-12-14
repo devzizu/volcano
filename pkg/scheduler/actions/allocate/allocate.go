@@ -295,7 +295,7 @@ func (alloc *Action) allocateResources(queues *util.PriorityQueue, jobsMap map[a
 
 // schedulingGateRemoval queues async gate removal if scheduling failed
 // This ensures CA can see the Unschedulable condition and trigger scale-up
-func (alloc *Action) schedulingGateRemoval(task *api.TaskInfo) {
+func (alloc *Action) schedulingGateRemoval(task *api.TaskInfo, queueID api.QueueID) {
 	// Only enqueue gate removal if the task has only Volcano scheduling gate
 	if cache.HasOnlyVolcanoSchedulingGate(task.Pod) {
 		op := schGateRemovalOperation{
@@ -306,9 +306,10 @@ func (alloc *Action) schedulingGateRemoval(task *api.TaskInfo) {
 		select {
 		case alloc.schGateRemovalStopCh <- op:
 			klog.V(4).Infof("Queued gate removal for %s/%s (scheduling failed)", task.Namespace, task.Name)
-			// Update task state immediately so it won't be queued again
+			// Update task state immediately so it won't be queued again in this cycle
 			task.SchGated = false
-			task.RemoveGateDuringBind = false
+			// Invalidate capacity plugin's reserved cache for this queue since task state changed
+			alloc.session.InvalidateCapacityReservedCache(queueID)
 		default:
 			klog.Warningf("Gate operation queue full, skipping gate removal for %s/%s", task.Namespace, task.Name)
 		}
@@ -464,32 +465,24 @@ func (alloc *Action) allocateResourcesForTasks(tasks *util.PriorityQueue, job *a
 	for !tasks.Empty() {
 		task := tasks.Pop().(*api.TaskInfo)
 
-		klog.Infof("[DEBUG] Processing task %s/%s: SchGated=%v, RemoveGateDuringBind=%v",
-			task.Namespace, task.Name, task.SchGated, task.RemoveGateDuringBind)
-
 		if !ssn.Allocatable(queue, task) {
 			klog.V(3).Infof("Queue <%s> is overused when considering task <%s>, ignore it.", queue.Name, task.Name)
 			continue
 		}
 
-		klog.Infof("[DEBUG] Task %s/%s passed Allocatable check (queue %s has capacity)", task.Namespace, task.Name, queue.Name)
-
 		// Queue has capacity - mark task for gate removal during bind
 		if task.SchGated && cache.HasOnlyVolcanoSchedulingGate(task.Pod) {
 			// Mark task to have gate removed atomically during bind
 			task.RemoveGateDuringBind = true
-			klog.Infof("Task %s/%s will have gate removed during bind (queue %s has capacity)",
+			klog.V(4).Infof("Task %s/%s will have gate removed during bind (queue %s has capacity)",
 				task.Namespace, task.Name, queue.Name)
 		}
 
 		// Skip tasks with external (non-Volcano) scheduling gates
 		if task.SchGated && !task.RemoveGateDuringBind {
-			klog.Infof("[DEBUG] Task %s/%s has non-Volcano gate, skipping (SchGated=%v, RemoveGateDuringBind=%v)",
-				task.Namespace, task.Name, task.SchGated, task.RemoveGateDuringBind)
+			klog.V(4).Infof("Task %s/%s has non-Volcano gate, skipping", task.Namespace, task.Name)
 			continue
 		}
-
-		klog.Infof("[DEBUG] Task %s/%s passed gate checks, proceeding to scheduling", task.Namespace, task.Name)
 
 		// check if the task with its spec has already predicates failed
 		if job.TaskHasFitErrors(task) {
@@ -509,8 +502,8 @@ func (alloc *Action) allocateResourcesForTasks(tasks *util.PriorityQueue, job *a
 
 			// PrePredicate failed, enqueue gate removal
 			// Unschedulable will be set in the Pod Status reason
-			klog.Infof("Removing gate for task (prepredicate failed): %s/%s", task.Namespace, task.Name)
-			alloc.schedulingGateRemoval(task)
+			klog.V(3).Infof("PrePredicate failed for task %s/%s, removing gate", task.Namespace, task.Name)
+			alloc.schedulingGateRemoval(task, queue.UID)
 
 			// PrePredicate failed, break from continuously allocating
 			break
@@ -543,8 +536,8 @@ func (alloc *Action) allocateResourcesForTasks(tasks *util.PriorityQueue, job *a
 
 			// No predicate nodes found, enqueue gate removal
 			// Unschedulable will be set in the Pod Status reason
-			klog.Infof("Removing gate for task (no predicate nodes found): %s/%s", task.Namespace, task.Name)
-			alloc.schedulingGateRemoval(task)
+			klog.V(3).Infof("No predicate nodes found for task %s/%s, removing gate", task.Namespace, task.Name)
+			alloc.schedulingGateRemoval(task, queue.UID)
 
 			// Assume that all left tasks are allocatable, but can not meet gang-scheduling min member,
 			// so we should break from continuously allocating.
@@ -565,8 +558,8 @@ func (alloc *Action) allocateResourcesForTasks(tasks *util.PriorityQueue, job *a
 
 			// No best node found after prioritization, enqueue gate removal
 			// Unschedulable will be set in the Pod Status reason
-			klog.Infof("Removing gate for task (no best node found): %s/%s", task.Namespace, task.Name)
-			alloc.schedulingGateRemoval(task)
+			klog.V(3).Infof("No best node found for task %s/%s, removing gate", task.Namespace, task.Name)
+			alloc.schedulingGateRemoval(task, queue.UID)
 
 			continue
 		}
