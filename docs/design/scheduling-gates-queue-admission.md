@@ -130,7 +130,7 @@ Kubernetes `schedulingGates` can only be removed and **not added after pod creat
 The gates will then be gradually removed in the scheduler side, since the latter contains the actions and plugins that
 determine if the Pod can be allocated to a queue and eventually a node:
 
-- **During bind**: For successfully allocated pods, gates are removed atomically with binding.
+- **During bind**: For successfully allocated pods, gates **should be** removed atomically with binding.
 - **For lack of cluster capacity**: When queue has capacity but no node can fit the pod, gates are removed to signal the
   `Unschedulable` condition to autoscalers and trigger a scale-up.
 
@@ -177,11 +177,13 @@ action while still being prevented from allocation until the gate is removed.
 
 ##### Queue Allocation and Gate Removal
 
-Each time the `Allocate` action is executed, `alloc.allocateResourcesForTasks(...)` tries to allocate resources for each
-Task in a given Queue and `ssn.Allocatable(queue, task)` gives us the needed signal (by running every plugin check) for
-eventually removing the gate added previously by the **MutatingAdmissionWebhook**. Gates should be removed for signaling
-the `Unschedulable` condition to autoscalers when no node fits the pod, otherwise, the pod will be allocated to a node
-and gates are removed during the bind operation.
+Each time the `Allocate` action is executed,
+[`allocateResourcesForTasks(...)`](https://github.com/volcano-sh/volcano/blob/v1.13.0/pkg/scheduler/actions/allocate/allocate.go#L356)
+tries to allocate resources for each Task in a given Queue and
+[`ssn.Allocatable(queue, task)`](https://github.com/volcano-sh/volcano/blob/v1.13.0/pkg/scheduler/actions/allocate/allocate.go#L365)
+gives us the needed signal (by running every plugin check) for eventually removing the gate added previously by the
+**MutatingAdmissionWebhook**. Gates should be removed for signaling the `Unschedulable` condition to autoscalers when no
+node fits the pod, otherwise, the pod will be allocated to a node and gates are removed during the bind operation.
 
 To avoid blocking the scheduler, gate removals for lack of cluster capacity are queued to background workers and
 processed asynchronously. The following code snippet showcases the possible high-level changes to the function
@@ -363,10 +365,12 @@ func (cp *capacityPlugin) queueAllocatableWithReserved(attr *queueAttr, candidat
     // Exclude candidate from reserved if it's already counted (avoid double-counting)
     adjustedReserved := reserved.Clone()
     if !candidate.SchGated && candidate.Status == api.Pending &&
-        cache.HasQueueAllocationGateAnnotation(candidate.Pod) &&
-        !adjustedReserved.LessEqual(candidate.Resreq, api.Zero) {
-        // Candidate was counted in reserved, subtract it to avoid double-counting in futureUsed
-        adjustedReserved.Sub(candidate.Resreq)
+        cache.HasQueueAllocationGateAnnotation(candidate.Pod) {
+        // Check if we have enough reserved resources to subtract (avoid panic)
+        if candidate.Resreq.LessEqual(adjustedReserved, api.Zero) {
+            // Candidate was counted in reserved, subtract it to avoid double-counting in futureUsed
+            adjustedReserved.Sub(candidate.Resreq)
+        }
     }
 
     // Check capacity: allocated + adjustedReserved + candidate <= queue capacity

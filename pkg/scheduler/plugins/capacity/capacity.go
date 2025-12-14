@@ -892,12 +892,14 @@ func (cp *capacityPlugin) queueAllocatableWithReserved(attr *queueAttr, candidat
 	// Exclude candidate from reserved if it's already counted (avoid double-counting)
 	adjustedReserved := reserved.Clone()
 	if !candidate.SchGated && candidate.Status == api.Pending &&
-		cache.HasQueueAllocationGateAnnotation(candidate.Pod) &&
-		!adjustedReserved.LessEqual(candidate.Resreq, api.Zero) {
-		// Candidate was counted in reserved, subtract it to avoid double-counting in futureUsed
-		adjustedReserved.Sub(candidate.Resreq)
-		klog.V(4).Infof("Excluding candidate %s/%s from reserved for capacity check",
-			candidate.Namespace, candidate.Name)
+		cache.HasQueueAllocationGateAnnotation(candidate.Pod) {
+		// Check if we have enough reserved resources to subtract (avoid panic)
+		if candidate.Resreq.LessEqual(adjustedReserved, api.Zero) {
+			// Candidate was counted in reserved, subtract it to avoid double-counting in futureUsed
+			adjustedReserved.Sub(candidate.Resreq)
+			klog.Infof("Excluding candidate %s/%s from reserved for capacity check",
+				candidate.Namespace, candidate.Name)
+		}
 	}
 
 	// Include reserved resources in capacity check
