@@ -49,9 +49,9 @@ type Action struct {
 	hyperNodeScoresByJob map[string]map[string]float64
 
 	// Async gate management infrastructure
-	schGateRemovalStopCh     chan schGateRemovalOperation
-	schGateRemovalWorkersWg  sync.WaitGroup
-	schGateRemovalShutdownCh chan struct{}
+	schGateRemovalCh        chan schGateRemovalOperation
+	schGateRemovalWorkersWg sync.WaitGroup
+	schGateRemovalStopCh    chan struct{}
 
 	startedWorkers bool
 }
@@ -65,8 +65,8 @@ func New() *Action {
 	return &Action{
 		enablePredicateErrorCache: true, // default to enable it
 		hyperNodeScoresByJob:      make(map[string]map[string]float64),
-		schGateRemovalStopCh:      make(chan schGateRemovalOperation, 1000),
-		schGateRemovalShutdownCh:  make(chan struct{}),
+		schGateRemovalCh:          make(chan schGateRemovalOperation, 1000),
+		schGateRemovalStopCh:      make(chan struct{}),
 	}
 }
 
@@ -87,13 +87,13 @@ func (alloc *Action) Initialize() {
 
 func (alloc *Action) UnInitialize() {
 	// Signal workers to shutdown
-	close(alloc.schGateRemovalShutdownCh)
+	close(alloc.schGateRemovalStopCh)
 
 	// Wait for all workers to finish
 	alloc.schGateRemovalWorkersWg.Wait()
 
 	// Close the channel
-	close(alloc.schGateRemovalStopCh)
+	close(alloc.schGateRemovalCh)
 
 	klog.V(3).Infof("Async gate removal workers shut down")
 }
@@ -103,10 +103,10 @@ func (alloc *Action) schGateRemovalWorker() {
 	defer alloc.schGateRemovalWorkersWg.Done()
 	for {
 		select {
-		case <-alloc.schGateRemovalShutdownCh:
+		case <-alloc.schGateRemovalStopCh:
 			klog.V(4).Infof("Scheduling gate operation worker shutting down")
 			return
-		case op := <-alloc.schGateRemovalStopCh:
+		case op := <-alloc.schGateRemovalCh:
 			// Fetch fresh pod state from API server
 			pod, err := alloc.session.KubeClient().CoreV1().Pods(op.namespace).Get(
 				context.TODO(),
@@ -304,7 +304,7 @@ func (alloc *Action) schedulingGateRemoval(task *api.TaskInfo, queueID api.Queue
 		}
 
 		select {
-		case alloc.schGateRemovalStopCh <- op:
+		case alloc.schGateRemovalCh <- op:
 			klog.V(4).Infof("Queued gate removal for %s/%s (scheduling failed)", task.Namespace, task.Name)
 			// Update task state immediately so it won't be queued again in this cycle
 			task.SchGated = false

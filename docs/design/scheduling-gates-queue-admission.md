@@ -273,7 +273,7 @@ func (alloc *Action) allocateResourcesForTasks(...) {
 func (alloc *Action) schedulingGateRemoval(task *api.TaskInfo, queueID api.QueueID) {
     if cache.HasOnlyVolcanoSchedulingGate(task.Pod) {
         op := schGateRemovalOperation{namespace: task.Namespace, name: task.Name}
-        alloc.schGateRemovalStopCh <- op
+        alloc.schGateRemovalCh <- op
         task.SchGated = false  // Mark as ungated in cache
 
         // Invalidate capacity plugin's reserved cache for this queue
@@ -293,9 +293,9 @@ type Action struct {
     // ...
 
     // Async gate removal channel
-    schGateRemovalStopCh chan schGateRemovalOperation
-    schGateRemovalWorkersWg   sync.WaitGroup
-    schGateRemovalShutdownCh  chan struct{}
+    schGateRemovalCh         chan schGateRemovalOperation
+    schGateRemovalWorkersWg  sync.WaitGroup
+    schGateRemovalStopCh     chan struct{}
 }
 
 type schGateRemovalOperation struct {
@@ -308,9 +308,9 @@ func (alloc *Action) schGateRemovalWorker() {
     defer alloc.schGateRemovalWorkersWg.Done()
     for {
         select {
-        case op := <-alloc.schGateRemovalStopCh:
+        case op := <-alloc.schGateRemovalCh:
             cache.RemoveVolcanoSchGate(kubeClient, op.namespace, op.name)
-        case <-alloc.schGateRemovalShutdownCh:
+        case <-alloc.schGateRemovalStopCh:
             return
         }
     }
