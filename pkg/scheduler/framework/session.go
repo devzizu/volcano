@@ -53,6 +53,12 @@ import (
 	"volcano.sh/volcano/pkg/scheduler/util"
 )
 
+// capacityCacheManager is an interface for managing the capacity plugin's reserved cache
+type capacityCacheManager interface {
+	AddTaskToReservedCache(queueID api.QueueID, task *api.TaskInfo)
+	RemoveTaskFromReservedCache(queueID api.QueueID, taskID api.TaskID)
+}
+
 // Session information for the current session
 type Session struct {
 	UID types.UID
@@ -682,21 +688,6 @@ func (ssn *Session) GetCycleState(taskID api.TaskID) *k8sframework.CycleState {
 	return obj.(*k8sframework.CycleState)
 }
 
-// InvalidateCapacityReservedCache invalidates the capacity plugin's reserved cache for a specific queue
-// This should be called when a task's SchGated state changes during a cycle
-func (ssn *Session) InvalidateCapacityReservedCache(queueID api.QueueID) {
-	// Find the capacity plugin and call its invalidation method
-	if plugin, found := ssn.plugins["capacity"]; found {
-		// Type assert to access the InvalidateReservedCache method
-		type cacheInvalidator interface {
-			InvalidateReservedCache(queueID api.QueueID)
-		}
-		if ci, ok := plugin.(cacheInvalidator); ok {
-			ci.InvalidateReservedCache(queueID)
-		}
-	}
-}
-
 // Evict the task in the session
 func (ssn *Session) Evict(reclaimee *api.TaskInfo, reason string) error {
 	if err := ssn.cache.Evict(reclaimee, reason); err != nil {
@@ -827,6 +818,24 @@ func (ssn *Session) HierarchyEnabled(pluginName string) bool {
 		}
 	}
 	return false
+}
+
+// AddTaskToCapacityReservedCache adds a task to the capacity plugin's reserved cache
+func (ssn *Session) AddTaskToCapacityReservedCache(queueID api.QueueID, task *api.TaskInfo) {
+	if plugin, found := ssn.plugins["capacity"]; found {
+		if cm, ok := plugin.(capacityCacheManager); ok {
+			cm.AddTaskToReservedCache(queueID, task)
+		}
+	}
+}
+
+// RemoveTaskFromCapacityReservedCache removes a task from the capacity plugin's reserved cache
+func (ssn *Session) RemoveTaskFromCapacityReservedCache(queueID api.QueueID, taskID api.TaskID) {
+	if plugin, found := ssn.plugins["capacity"]; found {
+		if cm, ok := plugin.(capacityCacheManager); ok {
+			cm.RemoveTaskFromReservedCache(queueID, taskID)
+		}
+	}
 }
 
 // String return nodes and jobs information in the session

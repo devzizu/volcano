@@ -550,20 +550,13 @@ func (ji *JobInfo) GetSchGatedPodResources() *Resource {
 		if task.SchGated {
 			// Exclude tasks that are only Volcano scheduling gated
 			// These should be counted in inqueue resources, not deducted
-			if hasOnlyVolcanoSchedulingGate(task.Pod) {
+			if HasOnlyVolcanoSchedulingGate(task.Pod) {
 				continue
 			}
 			res.Add(task.Resreq)
 		}
 	}
 	return res
-}
-
-// hasOnlyVolcanoSchedulingGate checks if pod has only the Volcano scheduling gate
-// This is a helper function to avoid circular dependency with cache package
-func hasOnlyVolcanoSchedulingGate(pod *v1.Pod) bool {
-	return len(pod.Spec.SchedulingGates) == 1 &&
-		pod.Spec.SchedulingGates[0].Name == "volcano.sh/queue-allocation-gate"
 }
 
 // DeductSchGatedResources deduct resources of scheduling gated pod from Resource res;

@@ -137,19 +137,6 @@ func getHyperNodeEventSource(source string) []string {
 	return parts
 }
 
-// HasOnlyVolcanoSchedulingGate checks if pod has only the Volcano gate
-func HasOnlyVolcanoSchedulingGate(pod *v1.Pod) bool {
-	return len(pod.Spec.SchedulingGates) == 1 &&
-		pod.Spec.SchedulingGates[0].Name == "volcano.sh/queue-allocation-gate"
-}
-
-// HasQueueAllocationGateAnnotation checks if pod has the queue allocation gate annotation
-// This indicates the pod has opted-in to the queue capacity-aware gate management
-func HasQueueAllocationGateAnnotation(pod *v1.Pod) bool {
-	return pod.Annotations != nil &&
-		pod.Annotations["volcano.sh/queue-allocation-gate"] == "true"
-}
-
 // RemoveVolcanoGate removes the Volcano scheduling gate from a pod via JSON patch
 func RemoveVolcanoSchGate(kubeClient kubernetes.Interface, pod *v1.Pod) error {
 	// Find the Volcano gate index

@@ -235,7 +235,7 @@ func (alloc *Action) allocateResources(queues *util.PriorityQueue, jobsMap map[a
 			tasks := util.NewPriorityQueue(ssn.TaskOrderFn)
 			for _, task := range job.TaskStatusIndex[api.Pending] {
 				// Skip tasks with non-Volcano gates (include tasks with only Volcano gate for later removal)
-				if task.SchGated && !cache.HasOnlyVolcanoSchedulingGate(task.Pod) {
+				if task.SchGated && !api.HasOnlyVolcanoSchedulingGate(task.Pod) {
 					klog.V(4).Infof("Task %s/%s has non-Volcano gate, skipping", task.Namespace, task.Name)
 					continue
 				}
@@ -297,7 +297,7 @@ func (alloc *Action) allocateResources(queues *util.PriorityQueue, jobsMap map[a
 // This ensures CA can see the Unschedulable condition and trigger scale-up
 func (alloc *Action) schedulingGateRemoval(task *api.TaskInfo, queueID api.QueueID) {
 	// Only enqueue gate removal if the task has only Volcano scheduling gate
-	if cache.HasOnlyVolcanoSchedulingGate(task.Pod) {
+	if api.HasOnlyVolcanoSchedulingGate(task.Pod) {
 		op := schGateRemovalOperation{
 			namespace: task.Namespace,
 			name:      task.Name,
@@ -308,8 +308,6 @@ func (alloc *Action) schedulingGateRemoval(task *api.TaskInfo, queueID api.Queue
 			klog.V(4).Infof("Queued gate removal for %s/%s (scheduling failed)", task.Namespace, task.Name)
 			// Update task state immediately so it won't be queued again in this cycle
 			task.SchGated = false
-			// Invalidate capacity plugin's reserved cache for this queue since task state changed
-			alloc.session.InvalidateCapacityReservedCache(queueID)
 		default:
 			klog.Warningf("Gate operation queue full, skipping gate removal for %s/%s", task.Namespace, task.Name)
 		}
@@ -471,9 +469,11 @@ func (alloc *Action) allocateResourcesForTasks(tasks *util.PriorityQueue, job *a
 		}
 
 		// Queue has capacity - mark task for gate removal during bind
-		if task.SchGated && cache.HasOnlyVolcanoSchedulingGate(task.Pod) {
+		if task.SchGated && api.HasOnlyVolcanoSchedulingGate(task.Pod) {
 			// Mark task to have gate removed atomically during bind
 			task.RemoveGateDuringBind = true
+			// Add to reserved cache immediately after passing capacity check
+			ssn.AddTaskToCapacityReservedCache(job.Queue, task)
 			klog.V(4).Infof("Task %s/%s will have gate removed during bind (queue %s has capacity)",
 				task.Namespace, task.Name, queue.Name)
 		}
@@ -743,6 +743,8 @@ func (alloc *Action) allocateResourcesForTask(stmt *framework.Statement, task *a
 					task.UID, node.Name, alloc.session.UID, rollbackErr)
 			}
 		} else {
+			// Task successfully allocated - remove from reserved cache if it was there
+			alloc.session.RemoveTaskFromCapacityReservedCache(job.Queue, task.UID)
 			metrics.UpdateE2eSchedulingDurationByJob(job.Name, string(job.Queue), job.Namespace, metrics.Duration(job.CreationTimestamp.Time))
 			metrics.UpdateE2eSchedulingLastTimeByJob(job.Name, string(job.Queue), job.Namespace, time.Now())
 		}
