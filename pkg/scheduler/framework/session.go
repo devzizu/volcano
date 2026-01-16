@@ -56,7 +56,7 @@ import (
 // capacityCacheManager is an interface for managing the capacity plugin's reserved cache
 type capacityCacheManager interface {
 	AddTaskToReservedCache(queueID api.QueueID, task *api.TaskInfo)
-	RemoveTaskFromReservedCache(queueID api.QueueID, taskID api.TaskID)
+	RemoveTaskFromReservedCache(taskID api.TaskID)
 }
 
 // Session information for the current session
@@ -830,10 +830,10 @@ func (ssn *Session) AddTaskToCapacityReservedCache(queueID api.QueueID, task *ap
 }
 
 // RemoveTaskFromCapacityReservedCache removes a task from the capacity plugin's reserved cache
-func (ssn *Session) RemoveTaskFromCapacityReservedCache(queueID api.QueueID, taskID api.TaskID) {
+func (ssn *Session) RemoveTaskFromCapacityReservedCache(taskID api.TaskID) {
 	if plugin, found := ssn.plugins["capacity"]; found {
 		if cm, ok := plugin.(capacityCacheManager); ok {
-			cm.RemoveTaskFromReservedCache(queueID, taskID)
+			cm.RemoveTaskFromReservedCache(taskID)
 		}
 	}
 }

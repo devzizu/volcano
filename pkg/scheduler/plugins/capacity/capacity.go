@@ -870,10 +870,18 @@ func (cp *capacityPlugin) AddTaskToReservedCache(queueID api.QueueID, task *api.
 
 // RemoveTaskFromReservedCache removes a specific task from the reserved cache
 // This should be called when a task becomes allocated (no longer needs reservation)
-func (cp *capacityPlugin) RemoveTaskFromReservedCache(queueID api.QueueID, taskID api.TaskID) {
-	if cp.queueGateReservedTasks[queueID] != nil {
-		delete(cp.queueGateReservedTasks[queueID], taskID)
-		klog.V(4).Infof("Removed task <%s> from reserved cache for queue <%s>", taskID, queueID)
+// It searches across all queues to find and remove the task
+func (cp *capacityPlugin) RemoveTaskFromReservedCache(taskID api.TaskID) {
+	for queueID, tasks := range cp.queueGateReservedTasks {
+		if _, exists := tasks[taskID]; exists {
+			delete(tasks, taskID)
+			// Clean up empty queue entries
+			if len(tasks) == 0 {
+				delete(cp.queueGateReservedTasks, queueID)
+			}
+			klog.V(4).Infof("Removed task <%s> from reserved cache for queue <%s>", taskID, queueID)
+			return
+		}
 	}
 }
 

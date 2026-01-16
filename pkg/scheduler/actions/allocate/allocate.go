@@ -284,6 +284,8 @@ func (alloc *Action) allocateResources(queues *util.PriorityQueue, jobsMap map[a
 		}
 
 		if stmt != nil {
+			// Remove allocated tasks from reserved cache before committing
+			alloc.removeAllocatedTasksFromReservedCache(stmt)
 			stmt.Commit()
 		}
 
@@ -731,6 +733,18 @@ func (alloc *Action) prioritizeNodes(ssn *framework.Session, task *api.TaskInfo,
 	return bestNode, higestScore
 }
 
+// removeAllocatedTasksFromReservedCache removes tasks from the reserved cache
+// for all Allocate operations in the statement. This should be called before
+// stmt.Commit() to ensure tasks are only removed if the allocation is committed.
+func (alloc *Action) removeAllocatedTasksFromReservedCache(stmt *framework.Statement) {
+	for _, op := range stmt.Operations() {
+		if op.Name() == framework.Allocate {
+			task := op.Task()
+			alloc.session.RemoveTaskFromCapacityReservedCache(task.UID)
+		}
+	}
+}
+
 func (alloc *Action) allocateResourcesForTask(stmt *framework.Statement, task *api.TaskInfo, node *api.NodeInfo, job *api.JobInfo) (err error) {
 	// Allocate idle resource to the task.
 	if task.InitResreq.LessEqual(node.Idle, api.Zero) {
@@ -743,8 +757,6 @@ func (alloc *Action) allocateResourcesForTask(stmt *framework.Statement, task *a
 					task.UID, node.Name, alloc.session.UID, rollbackErr)
 			}
 		} else {
-			// Task successfully allocated - remove from reserved cache if it was there
-			alloc.session.RemoveTaskFromCapacityReservedCache(job.Queue, task.UID)
 			metrics.UpdateE2eSchedulingDurationByJob(job.Name, string(job.Queue), job.Namespace, metrics.Duration(job.CreationTimestamp.Time))
 			metrics.UpdateE2eSchedulingLastTimeByJob(job.Name, string(job.Queue), job.Namespace, time.Now())
 		}
