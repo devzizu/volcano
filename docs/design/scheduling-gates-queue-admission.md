@@ -403,10 +403,10 @@ The capacity plugin struct is extended with the reserved task cache:
 type capacityPlugin struct {
     // ... existing fields ...
 
-    // queueReservedTasks tracks tasks that passed capacity checks but cannot be scheduled
+    // queueGateReservedTasks tracks tasks that passed capacity checks but cannot be scheduled
     // These tasks reserve queue capacity to prevent other tasks from consuming it
     // Rebuilt fresh at the start of each scheduling cycle in OnSessionOpen
-    queueReservedTasks map[api.QueueID]map[api.TaskID]*api.TaskInfo
+    queueGateReservedTasks map[api.QueueID]map[api.TaskID]*api.TaskInfo
 }
 ```
 
@@ -425,17 +425,17 @@ func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 
 func (cp *capacityPlugin) buildQueueReservedTasksCache(ssn *framework.Session) {
     // Initialize the cache for this session
-    cp.queueReservedTasks = make(map[api.QueueID]map[api.TaskID]*api.TaskInfo)
+    cp.queueGateReservedTasks = make(map[api.QueueID]map[api.TaskID]*api.TaskInfo)
 
     // Scan all pending tasks and rebuild cache
     for _, job := range ssn.Jobs {
         for _, task := range job.TaskStatusIndex[api.Pending] {
             // Tasks that passed capacity have: NO gate + HAS annotation + Pending status
             if !task.SchGated && api.HasQueueAllocationGateAnnotation(task.Pod) {
-                if cp.queueReservedTasks[job.Queue] == nil {
-                    cp.queueReservedTasks[job.Queue] = make(map[api.TaskID]*api.TaskInfo)
+                if cp.queueGateReservedTasks[job.Queue] == nil {
+                    cp.queueGateReservedTasks[job.Queue] = make(map[api.TaskID]*api.TaskInfo)
                 }
-                cp.queueReservedTasks[job.Queue][task.UID] = task
+                cp.queueGateReservedTasks[job.Queue][task.UID] = task
             }
         }
     }
@@ -488,7 +488,7 @@ This incremental update ensures that:
 
 > **Note**: The `AddTaskToCapacityReservedCache(...)` and `RemoveTaskFromCapacityReservedCache(...)` methods can be
 > implemented in the capacity plugin and exposed through the Session interface for use by the allocate action. These
-> methods simply add or remove tasks from the `queueReservedTasks` map.
+> methods simply add or remove tasks from the `queueGateReservedTasks` map.
 
 ###### Capacity Check with Reserved Resources
 
@@ -498,8 +498,8 @@ A new method `queueAllocatableWithReserved` performs capacity checks including r
 func (cp *capacityPlugin) queueAllocatableWithReserved(attr *queueAttr, candidate *api.TaskInfo, queue *api.QueueInfo) bool {
     // Calculate total reserved resources directly from cache
     reserved := api.EmptyResource()
-    if queueCache := cp.queueReservedTasks[queue.UID]; queueCache != nil {
-        for _, task := range queueCache {
+    if queueGateReserved := cp.queueGateReservedTasks[queue.UID]; queueGateReserved != nil {
+        for _, task := range queueGateReserved {
             if task.UID != candidate.UID {
                 // Skip candidate to avoid double-counting (it will be added in futureUsed below)
                 reserved.Add(task.Resreq)

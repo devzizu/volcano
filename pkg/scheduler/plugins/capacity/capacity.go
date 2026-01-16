@@ -52,10 +52,10 @@ type capacityPlugin struct {
 	queueOpts map[api.QueueID]*queueAttr
 	// Arguments given for the plugin
 	pluginArguments framework.Arguments
-	// queueReservedTasks tracks tasks that passed capacity checks but cannot be scheduled
+	// queueGateReservedTasks tracks tasks that passed capacity checks but cannot be scheduled
 	// These tasks reserve queue capacity to prevent other tasks from consuming it
 	// Rebuilt fresh at the start of each scheduling cycle in OnSessionOpen
-	queueReservedTasks map[api.QueueID]map[api.TaskID]*api.TaskInfo
+	queueGateReservedTasks map[api.QueueID]map[api.TaskID]*api.TaskInfo
 }
 
 type queueAttr struct {
@@ -81,11 +81,11 @@ type queueAttr struct {
 // New return capacityPlugin action
 func New(arguments framework.Arguments) framework.Plugin {
 	return &capacityPlugin{
-		totalResource:      api.EmptyResource(),
-		totalGuarantee:     api.EmptyResource(),
-		queueOpts:          map[api.QueueID]*queueAttr{},
-		pluginArguments:    arguments,
-		queueReservedTasks: make(map[api.QueueID]map[api.TaskID]*api.TaskInfo),
+		totalResource:          api.EmptyResource(),
+		totalGuarantee:         api.EmptyResource(),
+		queueOpts:              map[api.QueueID]*queueAttr{},
+		pluginArguments:        arguments,
+		queueGateReservedTasks: make(map[api.QueueID]map[api.TaskID]*api.TaskInfo),
 	}
 }
 
@@ -367,7 +367,7 @@ func (cp *capacityPlugin) OnSessionClose(ssn *framework.Session) {
 	cp.totalResource = nil
 	cp.totalGuarantee = nil
 	cp.queueOpts = nil
-	cp.queueReservedTasks = nil
+	cp.queueGateReservedTasks = nil
 }
 
 func (cp *capacityPlugin) buildQueueAttrs(ssn *framework.Session) {
@@ -861,18 +861,18 @@ func (cp *capacityPlugin) queueAllocatable(queue *api.QueueInfo, candidate *api.
 // AddTaskToReservedCache adds a task to the reserved cache
 // This should be called when a task passes capacity checks
 func (cp *capacityPlugin) AddTaskToReservedCache(queueID api.QueueID, task *api.TaskInfo) {
-	if cp.queueReservedTasks[queueID] == nil {
-		cp.queueReservedTasks[queueID] = make(map[api.TaskID]*api.TaskInfo)
+	if cp.queueGateReservedTasks[queueID] == nil {
+		cp.queueGateReservedTasks[queueID] = make(map[api.TaskID]*api.TaskInfo)
 	}
-	cp.queueReservedTasks[queueID][task.UID] = task
+	cp.queueGateReservedTasks[queueID][task.UID] = task
 	klog.V(4).Infof("Added task <%s/%s> to reserved cache for queue <%s>", task.Namespace, task.Name, queueID)
 }
 
 // RemoveTaskFromReservedCache removes a specific task from the reserved cache
 // This should be called when a task becomes allocated (no longer needs reservation)
 func (cp *capacityPlugin) RemoveTaskFromReservedCache(queueID api.QueueID, taskID api.TaskID) {
-	if cp.queueReservedTasks[queueID] != nil {
-		delete(cp.queueReservedTasks[queueID], taskID)
+	if cp.queueGateReservedTasks[queueID] != nil {
+		delete(cp.queueGateReservedTasks[queueID], taskID)
 		klog.V(4).Infof("Removed task <%s> from reserved cache for queue <%s>", taskID, queueID)
 	}
 }
@@ -884,16 +884,16 @@ func (cp *capacityPlugin) RemoveTaskFromReservedCache(queueID api.QueueID, taskI
 // - HAS queue allocation scheduling gate annotation (proof they opted-in and passed capacity check)
 func (cp *capacityPlugin) buildQueueReservedTasksCache(ssn *framework.Session) {
 	// Initialize the cache for this session
-	cp.queueReservedTasks = make(map[api.QueueID]map[api.TaskID]*api.TaskInfo)
+	cp.queueGateReservedTasks = make(map[api.QueueID]map[api.TaskID]*api.TaskInfo)
 
 	// Scan all pending tasks and rebuild cache
 	for _, job := range ssn.Jobs {
 		for _, task := range job.TaskStatusIndex[api.Pending] {
 			if !task.SchGated && api.HasQueueAllocationGateAnnotation(task.Pod) {
-				if cp.queueReservedTasks[job.Queue] == nil {
-					cp.queueReservedTasks[job.Queue] = make(map[api.TaskID]*api.TaskInfo)
+				if cp.queueGateReservedTasks[job.Queue] == nil {
+					cp.queueGateReservedTasks[job.Queue] = make(map[api.TaskID]*api.TaskInfo)
 				}
-				cp.queueReservedTasks[job.Queue][task.UID] = task
+				cp.queueGateReservedTasks[job.Queue][task.UID] = task
 				klog.V(4).Infof("Reserved cache: task <%s/%s> reserves capacity in queue <%s>",
 					task.Namespace, task.Name, job.Queue)
 			}
@@ -904,8 +904,8 @@ func (cp *capacityPlugin) buildQueueReservedTasksCache(ssn *framework.Session) {
 func (cp *capacityPlugin) queueAllocatableWithReserved(attr *queueAttr, candidate *api.TaskInfo, queue *api.QueueInfo) bool {
 	// Calculate total reserved resources directly from cache
 	reserved := api.EmptyResource()
-	if queueCache := cp.queueReservedTasks[queue.UID]; queueCache != nil {
-		for _, task := range queueCache {
+	if queueGateReserved := cp.queueGateReservedTasks[queue.UID]; queueGateReserved != nil {
+		for _, task := range queueGateReserved {
 			if task.UID != candidate.UID {
 				// Skip candidate to avoid double-counting (it will be added in futureUsed below)
 				reserved.Add(task.Resreq)
