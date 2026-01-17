@@ -284,8 +284,8 @@ func (alloc *Action) allocateResources(queues *util.PriorityQueue, jobsMap map[a
 		}
 
 		if stmt != nil {
-			// Remove allocated tasks from reserved cache before committing
-			alloc.removeAllocatedTasksFromReservedCache(stmt)
+			// Clean up reservations for successfully allocated tasks
+			ssn.CleanupReservations(stmt)
 			stmt.Commit()
 		}
 
@@ -468,16 +468,6 @@ func (alloc *Action) allocateResourcesForTasks(tasks *util.PriorityQueue, job *a
 		if !ssn.Allocatable(queue, task) {
 			klog.V(3).Infof("Queue <%s> is overused when considering task <%s>, ignore it.", queue.Name, task.Name)
 			continue
-		}
-
-		// Queue has capacity - mark task for gate removal during bind
-		if task.SchGated && api.HasOnlyVolcanoSchedulingGate(task.Pod) {
-			// Mark task to have gate removed atomically during bind
-			task.RemoveGateDuringBind = true
-			// Add to reserved cache immediately after passing capacity check
-			ssn.AddTaskToCapacityReservedCache(job.Queue, task)
-			klog.V(4).Infof("Task %s/%s will have gate removed during bind (queue %s has capacity)",
-				task.Namespace, task.Name, queue.Name)
 		}
 
 		// Skip tasks with external (non-Volcano) scheduling gates
@@ -731,18 +721,6 @@ func (alloc *Action) prioritizeNodes(ssn *framework.Session, task *api.TaskInfo,
 		}
 	}
 	return bestNode, higestScore
-}
-
-// removeAllocatedTasksFromReservedCache removes tasks from the reserved cache
-// for all Allocate operations in the statement. This should be called before
-// stmt.Commit() to ensure tasks are only removed if the allocation is committed.
-func (alloc *Action) removeAllocatedTasksFromReservedCache(stmt *framework.Statement) {
-	for _, op := range stmt.Operations() {
-		if op.Name() == framework.Allocate {
-			task := op.Task()
-			alloc.session.RemoveTaskFromCapacityReservedCache(task.UID)
-		}
-	}
 }
 
 func (alloc *Action) allocateResourcesForTask(stmt *framework.Statement, task *api.TaskInfo, node *api.NodeInfo, job *api.JobInfo) (err error) {

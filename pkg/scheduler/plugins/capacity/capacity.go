@@ -102,6 +102,16 @@ func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 	// Rebuild reserved cache for this scheduling cycle
 	cp.buildQueueReservedTasksCache(ssn)
 
+	// Register cleanup function for successful allocations
+	ssn.AddReservationCleanupFn(cp.Name(), func(stmt *framework.Statement) {
+		for _, op := range stmt.Operations() {
+			if op.Name() == framework.Allocate {
+				task := op.Task()
+				cp.removeTaskFromReservedCache(task.UID)
+			}
+		}
+	})
+
 	hierarchyEnabled := ssn.HierarchyEnabled(cp.Name())
 	readyToSchedule := true
 	if hierarchyEnabled {
@@ -182,7 +192,19 @@ func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 			return false
 		}
 
-		return cp.checkQueueAllocatableHierarchically(ssn, queue, candidate)
+		allocatable := cp.checkQueueAllocatableHierarchically(ssn, queue, candidate)
+
+		// If queue has capacity and task has volcano gate, add to reserved cache
+		if allocatable && candidate.SchGated && api.HasOnlyVolcanoSchedulingGate(candidate.Pod) {
+			// Mark task to have gate removed during bind
+			candidate.RemoveGateDuringBind = true
+			// Add to reserved cache immediately after passing capacity check
+			cp.addTaskToReservedCache(queue.UID, candidate)
+			klog.V(4).Infof("Task %s/%s will have gate removed during bind (queue %s has capacity)",
+				candidate.Namespace, candidate.Name, queue.Name)
+		}
+
+		return allocatable
 	})
 
 	ssn.AddJobEnqueueableFn(cp.Name(), func(obj interface{}) int {
@@ -858,9 +880,9 @@ func (cp *capacityPlugin) queueAllocatable(queue *api.QueueInfo, candidate *api.
 	return cp.queueAllocatableWithReserved(attr, candidate, queue)
 }
 
-// AddTaskToReservedCache adds a task to the reserved cache
+// addTaskToReservedCache adds a task to the reserved cache
 // This should be called when a task passes capacity checks
-func (cp *capacityPlugin) AddTaskToReservedCache(queueID api.QueueID, task *api.TaskInfo) {
+func (cp *capacityPlugin) addTaskToReservedCache(queueID api.QueueID, task *api.TaskInfo) {
 	if cp.queueGateReservedTasks[queueID] == nil {
 		cp.queueGateReservedTasks[queueID] = make(map[api.TaskID]*api.TaskInfo)
 	}
@@ -871,7 +893,7 @@ func (cp *capacityPlugin) AddTaskToReservedCache(queueID api.QueueID, task *api.
 // RemoveTaskFromReservedCache removes a specific task from the reserved cache
 // This should be called when a task becomes allocated (no longer needs reservation)
 // It searches across all queues to find and remove the task
-func (cp *capacityPlugin) RemoveTaskFromReservedCache(taskID api.TaskID) {
+func (cp *capacityPlugin) removeTaskFromReservedCache(taskID api.TaskID) {
 	for queueID, tasks := range cp.queueGateReservedTasks {
 		if _, exists := tasks[taskID]; exists {
 			delete(tasks, taskID)

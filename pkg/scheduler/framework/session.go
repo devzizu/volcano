@@ -53,12 +53,6 @@ import (
 	"volcano.sh/volcano/pkg/scheduler/util"
 )
 
-// capacityCacheManager is an interface for managing the capacity plugin's reserved cache
-type capacityCacheManager interface {
-	AddTaskToReservedCache(queueID api.QueueID, task *api.TaskInfo)
-	RemoveTaskFromReservedCache(taskID api.TaskID)
-}
-
 // Session information for the current session
 type Session struct {
 	UID types.UID
@@ -138,6 +132,7 @@ type Session struct {
 	simulateAddTaskFns     map[string]api.SimulateAddTaskFn
 	simulatePredicateFns   map[string]api.SimulatePredicateFn
 	simulateAllocatableFns map[string]api.SimulateAllocatableFn
+	reservationCleanupFns  map[string]ReservationCleanupFn
 
 	// cycleStatesMap is used to temporarily store the scheduling status of each pod, its life cycle is same as Session.
 	// Because state needs to be passed between different extension points (not only used in PreFilter and Filter),
@@ -202,6 +197,7 @@ func openSession(cache cache.Cache) *Session {
 		simulateAddTaskFns:     map[string]api.SimulateAddTaskFn{},
 		simulatePredicateFns:   map[string]api.SimulatePredicateFn{},
 		simulateAllocatableFns: map[string]api.SimulateAllocatableFn{},
+		reservationCleanupFns:  map[string]ReservationCleanupFn{},
 	}
 
 	snapshot := cache.Snapshot()
@@ -818,24 +814,6 @@ func (ssn *Session) HierarchyEnabled(pluginName string) bool {
 		}
 	}
 	return false
-}
-
-// AddTaskToCapacityReservedCache adds a task to the capacity plugin's reserved cache
-func (ssn *Session) AddTaskToCapacityReservedCache(queueID api.QueueID, task *api.TaskInfo) {
-	if plugin, found := ssn.plugins["capacity"]; found {
-		if cm, ok := plugin.(capacityCacheManager); ok {
-			cm.AddTaskToReservedCache(queueID, task)
-		}
-	}
-}
-
-// RemoveTaskFromCapacityReservedCache removes a task from the capacity plugin's reserved cache
-func (ssn *Session) RemoveTaskFromCapacityReservedCache(taskID api.TaskID) {
-	if plugin, found := ssn.plugins["capacity"]; found {
-		if cm, ok := plugin.(capacityCacheManager); ok {
-			cm.RemoveTaskFromReservedCache(taskID)
-		}
-	}
 }
 
 // String return nodes and jobs information in the session
