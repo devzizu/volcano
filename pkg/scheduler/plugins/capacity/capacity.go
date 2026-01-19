@@ -103,7 +103,8 @@ func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 	cp.buildQueueReservedTasksCache(ssn)
 
 	// Register cleanup function for successful allocations
-	ssn.AddReservationCleanupFn(cp.Name(), func(stmt *framework.Statement) {
+	ssn.AddCleanupReservationsFn(cp.Name(), func(obj interface{}) {
+		stmt := obj.(*framework.Statement)
 		for _, op := range stmt.Operations() {
 			if op.Name() == framework.Allocate {
 				task := op.Task()

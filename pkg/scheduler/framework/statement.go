@@ -44,11 +44,6 @@ const (
 	Allocate
 )
 
-// ReservationCleanupFn is the function declaration used to clean up reservations
-// after a statement is prepared for commit. Plugins can use this to remove reserved
-// resources for tasks that have been successfully allocated in the statement.
-type ReservationCleanupFn func(*Statement)
-
 type operation struct {
 	name   Operation
 	task   *api.TaskInfo

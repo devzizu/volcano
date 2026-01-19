@@ -132,6 +132,11 @@ func (ssn *Session) AddAllocatableFn(name string, fn api.AllocatableFn) {
 	ssn.allocatableFns[name] = fn
 }
 
+// AddCleanupReservationsFn registers a cleanup function to be called before statement commit
+func (ssn *Session) AddCleanupReservationsFn(name string, fn api.CleanupReservationsFn) {
+	ssn.cleanupReservationsFns[name] = fn
+}
+
 // AddJobValidFn add jobvalid function
 func (ssn *Session) AddJobValidFn(name string, fn api.ValidateExFn) {
 	ssn.jobValidFns[name] = fn
@@ -155,12 +160,6 @@ func (ssn *Session) AddTargetJobFn(name string, fn api.TargetJobFn) {
 // AddReservedNodesFn add reservedNodesFn function
 func (ssn *Session) AddReservedNodesFn(name string, fn api.ReservedNodesFn) {
 	ssn.reservedNodesFns[name] = fn
-}
-
-// AddReservationCleanupFn adds a reservation cleanup function
-// This allows plugins to register cleanup logic that runs before statement commit
-func (ssn *Session) AddReservationCleanupFn(name string, fn ReservationCleanupFn) {
-	ssn.reservationCleanupFns[name] = fn
 }
 
 // AddVictimTasksFns add victimTasksFns function
@@ -348,11 +347,9 @@ func (ssn *Session) Allocatable(queue *api.QueueInfo, candidate *api.TaskInfo) b
 	return true
 }
 
-// CleanupReservations executes all registered reservation cleanup functions
-// This should be called before committing a statement to allow plugins to clean up
-// reserved resources for successfully allocated tasks
+// CleanupReservations invokes all registered reservation cleanup functions
 func (ssn *Session) CleanupReservations(stmt *Statement) {
-	for _, fn := range ssn.reservationCleanupFns {
+	for _, fn := range ssn.cleanupReservationsFns {
 		fn(stmt)
 	}
 }

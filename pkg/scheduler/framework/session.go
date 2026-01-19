@@ -132,7 +132,7 @@ type Session struct {
 	simulateAddTaskFns     map[string]api.SimulateAddTaskFn
 	simulatePredicateFns   map[string]api.SimulatePredicateFn
 	simulateAllocatableFns map[string]api.SimulateAllocatableFn
-	reservationCleanupFns  map[string]ReservationCleanupFn
+	cleanupReservationsFns map[string]api.CleanupReservationsFn
 
 	// cycleStatesMap is used to temporarily store the scheduling status of each pod, its life cycle is same as Session.
 	// Because state needs to be passed between different extension points (not only used in PreFilter and Filter),
@@ -197,7 +197,7 @@ func openSession(cache cache.Cache) *Session {
 		simulateAddTaskFns:     map[string]api.SimulateAddTaskFn{},
 		simulatePredicateFns:   map[string]api.SimulatePredicateFn{},
 		simulateAllocatableFns: map[string]api.SimulateAllocatableFn{},
-		reservationCleanupFns:  map[string]ReservationCleanupFn{},
+		cleanupReservationsFns: map[string]api.CleanupReservationsFn{},
 	}
 
 	snapshot := cache.Snapshot()
