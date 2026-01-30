@@ -18,15 +18,10 @@ package allocate
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"sync"
 	"time"
 
-	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 
 	"volcano.sh/apis/pkg/apis/scheduling"
@@ -577,59 +572,6 @@ func (alloc *Action) allocateResourcesForTasks(tasks *util.PriorityQueue, job *a
 		}
 		return nil
 	}
-}
-
-// removeVolcanoSchGateFromPodByName removes the Volcano schGate from a pod using JSON Patch
-func removeVolcanoSchGateFromPodByName(kubeClient kubernetes.Interface, namespace, name string) error {
-	const volcanoSchGate = "volcano.sh/queue-allocation-gate"
-
-	pod, err := kubeClient.CoreV1().Pods(namespace).Get(context.TODO(), name, metav1.GetOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to get pod: %v", err)
-	}
-
-	// Check if schGate exists
-	hasSchGate := false
-	for _, gate := range pod.Spec.SchedulingGates {
-		if gate.Name == volcanoSchGate {
-			hasSchGate = true
-			break
-		}
-	}
-	if !hasSchGate {
-		klog.V(4).Infof("Pod %s/%s schGate already removed", namespace, name)
-		return nil
-	}
-
-	// Build new gates list without Volcano schGate
-	var newGates []v1.PodSchedulingGate
-	for _, gate := range pod.Spec.SchedulingGates {
-		if gate.Name != volcanoSchGate {
-			newGates = append(newGates, gate)
-		}
-	}
-
-	// Build JSON Patch
-	var patchOps []map[string]interface{}
-	if len(newGates) == 0 {
-		patchOps = []map[string]interface{}{{"op": "remove", "path": "/spec/schedulingGates"}}
-	} else {
-		patchOps = []map[string]interface{}{{"op": "replace", "path": "/spec/schedulingGates", "value": newGates}}
-	}
-
-	patchBytes, err := json.Marshal(patchOps)
-	if err != nil {
-		return fmt.Errorf("failed to marshal patch: %v", err)
-	}
-
-	klog.V(4).Infof("Patching %s/%s: %s", namespace, name, string(patchBytes))
-
-	_, err = kubeClient.CoreV1().Pods(namespace).Patch(context.TODO(), name, types.JSONPatchType, patchBytes, metav1.PatchOptions{})
-	if err != nil {
-		return fmt.Errorf("failed to patch pod: %v", err)
-	}
-
-	return nil
 }
 
 // getJobNewAllocatedHyperNode Obtain the newly allocated hyperNode for the job in soft topology mode

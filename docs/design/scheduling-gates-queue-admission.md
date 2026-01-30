@@ -568,9 +568,9 @@ The reservation cleanup mechanism follows the standard Volcano plugin extension 
 and
 [`AddPreemptiveFn`](https://github.com/volcano-sh/volcano/blob/v1.13.0/pkg/scheduler/framework/session_plugins.go#L125).
 The `CleanupReservationsFn` type can be defined in
-[`pkg/scheduler/api/types.go`](https://github.com/volcano-sh/volcano/blob/v1.13.0/pkg/scheduler/api/types.go)
-and allows any plugin to register cleanup logic that runs before statement commit. This design makes the architecture
-extensible, enabling other plugins like
+[`pkg/scheduler/api/types.go`](https://github.com/volcano-sh/volcano/blob/v1.13.0/pkg/scheduler/api/types.go) and allows
+any plugin to register cleanup logic that runs before statement commit. This design makes the architecture extensible,
+enabling other plugins like
 [`proportion`](https://github.com/volcano-sh/volcano/tree/v1.13.0/pkg/scheduler/plugins/proportion) or
 [`tdm`](https://github.com/volcano-sh/volcano/tree/v1.13.0/pkg/scheduler/plugins/tdm) to implement similar reservation
 cleanup logic in the future without modifying the framework.
@@ -588,7 +588,7 @@ func (db *DefaultBinder) Bind(...) map[schedulingapi.TaskID]string {
 
     for _, task := range tasks {
         if task.RemoveGateDuringBind {
-            if err := removeVolcanoSchGateFromPodByName(kubeClient, task.Namespace, task.Name); err != nil {
+            if err := RemoveVolcanoSchGate(kubeClient, task.Pod); err != nil {
                 // ...
             }
         }
