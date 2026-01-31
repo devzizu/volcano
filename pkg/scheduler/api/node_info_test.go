@@ -24,7 +24,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	fwk "k8s.io/kube-scheduler/framework"
 
-	"volcano.sh/volcano/pkg/scheduler/api/devices/ascend/ascend310p/vnpu"
+	"volcano.sh/volcano/pkg/scheduler/api/devices/ascend/mindcluster/ascend310p/vnpu"
 	"volcano.sh/volcano/pkg/scheduler/api/devices/nvidia/gpushare"
 	"volcano.sh/volcano/pkg/scheduler/api/devices/nvidia/vgpu"
 )
@@ -108,6 +108,9 @@ func TestNodeInfo_AddPod(t *testing.T) {
 	}
 
 	for i, test := range tests {
+		gpushare.GpuSharingEnable = true
+		vgpu.VGPUEnable = true
+		vnpu.AscendMindClusterVNPUEnable = true
 		ni := NewNodeInfo(test.node)
 		for _, pod := range test.pods {
 			pi := NewTaskInfo(pod)

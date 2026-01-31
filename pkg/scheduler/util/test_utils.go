@@ -35,6 +35,7 @@ import (
 	k8sframework "k8s.io/kubernetes/pkg/scheduler/framework"
 
 	schedulingv1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
+	nodeshardv1alpha1 "volcano.sh/apis/pkg/apis/shard/v1alpha1"
 	"volcano.sh/volcano/pkg/scheduler/api"
 )
 
@@ -147,6 +148,27 @@ func BuildPodWithPVC(namespace, name, nodename string, p v1.PodPhase, req v1.Res
 			},
 		},
 	}
+}
+
+// BuildPodWithAffinity builds a pod object with affinity
+func BuildPodWithAffinity(namespace, name, nodeName string, p v1.PodPhase, req v1.ResourceList, groupName string, labels map[string]string, selector map[string]string, affinity *v1.Affinity) *v1.Pod {
+	pod := BuildPod(namespace, name, nodeName, p, req, groupName, labels, selector)
+	pod.Spec.Affinity = affinity
+	return pod
+}
+
+// BuildPodWithTolerations builds a pod object with tolerations
+func BuildPodWithTolerations(namespace, name, nodeName string, p v1.PodPhase, req v1.ResourceList, groupName string, labels map[string]string, selector map[string]string, tolerations []v1.Toleration) *v1.Pod {
+	pod := BuildPod(namespace, name, nodeName, p, req, groupName, labels, selector)
+	pod.Spec.Tolerations = tolerations
+	return pod
+}
+
+// BuildPodWithTopologySpreadConstraints builds a pod object with topology spread constraints
+func BuildPodWithTopologySpreadConstraints(namespace, name, nodeName string, p v1.PodPhase, req v1.ResourceList, groupName string, labels map[string]string, selector map[string]string, constraints []v1.TopologySpreadConstraint) *v1.Pod {
+	pod := BuildPod(namespace, name, nodeName, p, req, groupName, labels, selector)
+	pod.Spec.TopologySpreadConstraints = constraints
+	return pod
 }
 
 // BuildPVC builds a PVC with specified storageclass and required resources
@@ -328,6 +350,35 @@ func BuildPodGroup(name, ns, queue string, minMember int32, taskMinMember map[st
 	}
 }
 
+func BuildSubGroupPolicy(name string, matchLabelKeys []string, mode string, highestTierAllowed int) schedulingv1beta1.SubGroupPolicySpec {
+	return BuildSubGroupPolicyWithSubGroupSize(name, matchLabelKeys, mode, highestTierAllowed, 1)
+}
+
+func BuildSubGroupPolicyWithSubGroupSize(name string, matchLabelKeys []string, mode string, highestTierAllowed int, subGroupSize int32) schedulingv1beta1.SubGroupPolicySpec {
+	return BuildSubGroupPolicyWithMinSubGroups(name, matchLabelKeys, mode, highestTierAllowed, subGroupSize, 0)
+}
+
+func BuildSubGroupPolicyWithMinSubGroups(name string, matchLabelKeys []string, mode string, highestTierAllowed int, subGroupSize, minSubGroups int32) schedulingv1beta1.SubGroupPolicySpec {
+	subGroupPolicy := schedulingv1beta1.SubGroupPolicySpec{
+		Name: name,
+		NetworkTopology: &schedulingv1beta1.NetworkTopologySpec{
+			Mode:               schedulingv1beta1.NetworkTopologyMode(mode),
+			HighestTierAllowed: &highestTierAllowed,
+		},
+		SubGroupSize: &subGroupSize,
+		MinSubGroups: &minSubGroups,
+	}
+	subGroupPolicy.MatchLabelKeys = matchLabelKeys
+	return subGroupPolicy
+}
+
+// BuildPodGroupWithSubGroupPolicy builds podGroup with NetworkTopology and SubGroupPolicy.
+func BuildPodGroupWithSubGroupPolicy(name, ns, hyperNodeName, queue string, minMember int32, taskMinMember map[string]int32, status schedulingv1beta1.PodGroupPhase, mode string, highestTierAllowed int, subGroupPolicy []schedulingv1beta1.SubGroupPolicySpec) *schedulingv1beta1.PodGroup {
+	pg := BuildPodGroupWithNetWorkTopologies(name, ns, hyperNodeName, queue, minMember, taskMinMember, status, mode, highestTierAllowed)
+	pg.Spec.SubGroupPolicy = subGroupPolicy
+	return pg
+}
+
 // BuildPodGroupWithNetWorkTopologies builds podGroup with NetWorkTopologies.
 func BuildPodGroupWithNetWorkTopologies(name, ns, hyperNodeName, queue string, minMember int32, taskMinMember map[string]int32, status schedulingv1beta1.PodGroupPhase, mode string, highestTierAllowed int) *schedulingv1beta1.PodGroup {
 	pg := BuildPodGroup(name, ns, queue, minMember, taskMinMember, status)
@@ -335,6 +386,17 @@ func BuildPodGroupWithNetWorkTopologies(name, ns, hyperNodeName, queue string, m
 	pg.Spec.NetworkTopology = &schedulingv1beta1.NetworkTopologySpec{
 		Mode:               schedulingv1beta1.NetworkTopologyMode(mode),
 		HighestTierAllowed: &highestTierAllowed,
+	}
+	return pg
+}
+
+// BuildPodGroupUsingNetWorkTopologiesWithTierName builds podGroup using NetWorkTopologies with highestTierName.
+func BuildPodGroupUsingNetWorkTopologiesWithTierName(name, ns, hyperNodeName, queue string, minMember int32, taskMinMember map[string]int32, status schedulingv1beta1.PodGroupPhase, mode, highestTierName string) *schedulingv1beta1.PodGroup {
+	pg := BuildPodGroup(name, ns, queue, minMember, taskMinMember, status)
+	pg.Annotations = map[string]string{api.JobAllocatedHyperNode: hyperNodeName}
+	pg.Spec.NetworkTopology = &schedulingv1beta1.NetworkTopologySpec{
+		Mode:            schedulingv1beta1.NetworkTopologyMode(mode),
+		HighestTierName: highestTierName,
 	}
 	return pg
 }
@@ -569,6 +631,12 @@ func (ftsu *FakeStatusUpdater) UpdatePodGroup(pg *api.PodGroup) (*api.PodGroup, 
 func (ftsu *FakeStatusUpdater) UpdateQueueStatus(queue *api.QueueInfo) error {
 	// do nothing here
 	return nil
+}
+
+// UpdateNodeShardStatus do fake empty update for node shard status
+func (ftsu *FakeStatusUpdater) UpdateNodeShardStatus(nodeshard *nodeshardv1alpha1.NodeShard) (*nodeshardv1alpha1.NodeShard, error) {
+	// do nothing here
+	return nodeshard, nil
 }
 
 // QueueWrapper wraps a schedulingv1beta1.Queue for fluent construction.

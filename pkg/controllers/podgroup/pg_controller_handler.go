@@ -100,14 +100,21 @@ func (pg *pgcontroller) addReplicaSet(obj interface{}) {
 		}
 		if podList != nil && len(podList.Items) > 0 {
 			pod := podList.Items[0]
-			klog.V(4).Infof("Try to create podgroup for pod %s", klog.KObj(&pod))
+			klog.V(4).Infof("Try to create or update podgroup for pod %s", klog.KObj(&pod))
 			if !slices.Contains(pg.schedulerNames, pod.Spec.SchedulerName) {
 				klog.V(4).Infof("Pod %s field SchedulerName is not matched", klog.KObj(&pod))
 				return
 			}
-			err := pg.createNormalPodPGIfNotExist(&pod)
+			// If the pod is already associated with a podgroup, skip creating a new one.
+			if pgName := pod.Annotations[scheduling.KubeGroupNameAnnotationKey]; pgName != "" {
+				klog.V(4).Infof("Pod %s is already associated with a podgroup %s", klog.KObj(&pod), pgName)
+				return
+			}
+			// In the upgrade scenario, need to synchronize and update the podgroup-related information.
+			// For example, if you update `scheduling.volcano.sh/group-min-member: "2"`, the podgroup's `minMember` needs to be updated to 2.
+			err := pg.createOrUpdateNormalPodPG(&pod)
 			if err != nil {
-				klog.Errorf("Failed to create PodGroup for pod %s: %v", klog.KObj(&pod), err)
+				klog.Errorf("Failed to create or update PodGroup for pod %s: %v", klog.KObj(&pod), err)
 			}
 		}
 	}
@@ -202,6 +209,7 @@ func (pg *pgcontroller) updatePodAnnotations(pod *v1.Pod, pgName string) error {
 			klog.Errorf("Failed to update pod <%s/%s>: %v", pod.Namespace, pod.Name, err)
 			return err
 		}
+		klog.V(4).Infof("Bound Pod <%s/%s> to PodGroup <%s/%s>", pod.Namespace, pod.Name, pod.Namespace, pgName)
 	} else {
 		if pod.Annotations[scheduling.KubeGroupNameAnnotationKey] != pgName {
 			klog.Errorf("normal pod %s/%s annotations %s value is not %s, but %s", pod.Namespace, pod.Name,
@@ -354,6 +362,7 @@ func (pg *pgcontroller) createOrUpdateNormalPodPG(pod *v1.Pod) error {
 				klog.Errorf("Failed to update PodGroup <%s/%s>: %v", pod.Namespace, pgName, err)
 				return err
 			}
+			klog.V(4).Infof("PodGroup <%s/%s> updated for Pod <%s/%s>", pod.Namespace, pgName, pod.Namespace, pod.Name)
 		}
 	}
 

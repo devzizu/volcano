@@ -26,23 +26,27 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/klog/v2"
-
 	"k8s.io/kubernetes/pkg/features"
+	"k8s.io/utils/ptr"
 
 	batch "volcano.sh/apis/pkg/apis/batch/v1alpha1"
 	"volcano.sh/apis/pkg/apis/scheduling"
 	"volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 )
+
+type subJobCondition func(*SubJobInfo) bool
 
 // DisruptionBudget define job min pod available and max pod unavailable value
 type DisruptionBudget struct {
@@ -330,7 +334,7 @@ func (ti TaskInfo) String() string {
 // JobID is the type of JobInfo's ID.
 type JobID types.UID
 
-type tasksMap map[TaskID]*TaskInfo
+type TasksMap map[TaskID]*TaskInfo
 
 // NodeResourceMap stores resource in a node
 type NodeResourceMap map[string]*Resource
@@ -354,9 +358,14 @@ type JobInfo struct {
 	JobFitErrors   string
 	NodesFitErrors map[TaskID]*FitErrors
 
+	AllocatedHyperNode string
+	SubJobs            map[SubJobID]*SubJobInfo
+	TaskToSubJob       map[TaskID]SubJobID
+	MinSubJobs         map[SubJobGID]int32 // key is name of "PodGroup.Spec.SubGroupPolicy", value is minSubGroups
+
 	// All tasks of the Job.
-	TaskStatusIndex       map[TaskStatus]tasksMap
-	Tasks                 tasksMap
+	TaskStatusIndex       map[TaskStatus]TasksMap
+	Tasks                 TasksMap
 	TaskMinAvailable      map[string]int32 // key is value of "volcano.sh/task-spec", value is number
 	TaskMinAvailableTotal int32
 
@@ -386,9 +395,12 @@ func NewJobInfo(uid JobID, tasks ...*TaskInfo) *JobInfo {
 		NodesFitErrors:   make(map[TaskID]*FitErrors),
 		Allocated:        EmptyResource(),
 		TotalRequest:     EmptyResource(),
-		TaskStatusIndex:  map[TaskStatus]tasksMap{},
-		Tasks:            tasksMap{},
+		TaskStatusIndex:  map[TaskStatus]TasksMap{},
+		Tasks:            TasksMap{},
 		TaskMinAvailable: map[string]int32{},
+		SubJobs:          map[SubJobID]*SubJobInfo{},
+		TaskToSubJob:     map[TaskID]SubJobID{},
+		MinSubJobs:       map[SubJobGID]int32{},
 	}
 
 	for _, task := range tasks {
@@ -401,6 +413,11 @@ func NewJobInfo(uid JobID, tasks ...*TaskInfo) *JobInfo {
 // UnsetPodGroup removes podGroup details from a job
 func (ji *JobInfo) UnsetPodGroup() {
 	ji.PodGroup = nil
+
+	clear(ji.SubJobs)
+	for _, task := range ji.Tasks {
+		ji.addTaskToSubJob(task)
+	}
 }
 
 // SetPodGroup sets podGroup details to a job
@@ -433,8 +450,25 @@ func (ji *JobInfo) SetPodGroup(pg *PodGroup) {
 
 	ji.ParseMinMemberInfo(pg)
 
+	oldPG := ji.PodGroup
 	ji.PgUID = pg.UID
 	ji.PodGroup = pg
+
+	if oldPG == nil || !equality.Semantic.DeepEqual(oldPG.Spec.SubGroupPolicy, pg.Spec.SubGroupPolicy) {
+		clear(ji.SubJobs)
+		for _, task := range ji.Tasks {
+			ji.addTaskToSubJob(task)
+		}
+		clear(ji.MinSubJobs)
+		for _, policy := range pg.Spec.SubGroupPolicy {
+			groupID := getSubJobGID(ji.UID, policy.Name)
+			if policy.MinSubGroups == nil {
+				ji.MinSubJobs[groupID] = 0
+			} else {
+				ji.MinSubJobs[groupID] = *policy.MinSubGroups
+			}
+		}
+	}
 }
 
 // extractWaitingTime reads sla waiting time for job from podgroup annotations
@@ -524,6 +558,7 @@ func (ji *JobInfo) extractBudget(pg *PodGroup) *DisruptionBudget {
 // 2. calculate sum of all roles' min members and set to TaskMinAvailableTotal
 func (ji *JobInfo) ParseMinMemberInfo(pg *PodGroup) {
 	taskMinAvailableTotal := int32(0)
+	clear(ji.TaskMinAvailable)
 	for task, member := range pg.Spec.MinTaskMember {
 		ji.TaskMinAvailable[task] = member
 		taskMinAvailableTotal += member
@@ -598,7 +633,7 @@ func (ji *JobInfo) GetElasticResources() *Resource {
 
 func (ji *JobInfo) addTaskIndex(ti *TaskInfo) {
 	if _, found := ji.TaskStatusIndex[ti.Status]; !found {
-		ji.TaskStatusIndex[ti.Status] = tasksMap{}
+		ji.TaskStatusIndex[ti.Status] = TasksMap{}
 	}
 	ji.TaskStatusIndex[ti.Status][ti.UID] = ti
 }
@@ -611,6 +646,7 @@ func (ji *JobInfo) AddTaskInfo(ti *TaskInfo) {
 	if AllocatedStatus(ti.Status) {
 		ji.Allocated.Add(ti.Resreq)
 	}
+	ji.addTaskToSubJob(ti)
 }
 
 // UpdateTaskStatus is used to update task's status in a job.
@@ -653,6 +689,7 @@ func (ji *JobInfo) DeleteTaskInfo(ti *TaskInfo) error {
 		}
 		delete(ji.Tasks, task.UID)
 		ji.deleteTaskIndex(task)
+		ji.deleteTaskFromSubJob(ti)
 		return nil
 	}
 
@@ -679,13 +716,17 @@ func (ji *JobInfo) Clone() *JobInfo {
 
 		PodGroup: ji.PodGroup.Clone(),
 
-		TaskStatusIndex:       map[TaskStatus]tasksMap{},
+		TaskStatusIndex:       map[TaskStatus]TasksMap{},
 		TaskMinAvailable:      make(map[string]int32, len(ji.TaskMinAvailable)),
 		TaskMinAvailableTotal: ji.TaskMinAvailableTotal,
-		Tasks:                 tasksMap{},
+		Tasks:                 TasksMap{},
 		Preemptable:           ji.Preemptable,
 		RevocableZone:         ji.RevocableZone,
 		Budget:                ji.Budget.Clone(),
+		AllocatedHyperNode:    ji.AllocatedHyperNode,
+		SubJobs:               map[SubJobID]*SubJobInfo{},
+		TaskToSubJob:          map[TaskID]SubJobID{},
+		MinSubJobs:            maps.Clone(ji.MinSubJobs),
 	}
 
 	ji.CreationTimestamp.DeepCopyInto(&info.CreationTimestamp)
@@ -695,6 +736,14 @@ func (ji *JobInfo) Clone() *JobInfo {
 	}
 	for _, task := range ji.Tasks {
 		info.AddTaskInfo(task.Clone())
+	}
+
+	for subJobID, subJob := range ji.SubJobs {
+		if sji, found := info.SubJobs[subJobID]; found {
+			sji.CloneStatusFrom(subJob)
+		} else {
+			klog.Errorf("Failed to clone subJob %s for job %s", subJob.UID, ji.UID)
+		}
 	}
 
 	return info
@@ -732,7 +781,12 @@ func (ji *JobInfo) FitError() string {
 		reasons[status.String()] += len(taskMap)
 	}
 	reasons["minAvailable"] = int(ji.MinAvailable)
-	reasonMsg := fmt.Sprintf("%v, %v", scheduling.PodGroupNotReady, strings.Join(sortReasonsHistogram(reasons), ", "))
+
+	podGroupStatus := scheduling.PodGroupNotReady
+	if ji.IsReady() {
+		podGroupStatus = scheduling.PodGroupReady
+	}
+	reasonMsg := fmt.Sprintf("%v, %v", podGroupStatus, strings.Join(sortReasonsHistogram(reasons), ", "))
 
 	// Stat histogram for pending tasks only
 	reasons = make(map[string]int)
@@ -825,10 +879,23 @@ func (ji *JobInfo) PendingBestEffortTaskNum() int32 {
 	return int32(count)
 }
 
+func (ji *JobInfo) AllocatedTaskNum() int32 {
+	count := 0
+	for status, tasks := range ji.TaskStatusIndex {
+		if AllocatedStatus(status) {
+			count += len(tasks)
+		}
+	}
+	return int32(count)
+}
+
 // FitFailedRoles returns the job roles' failed fit records
-func (ji *JobInfo) FitFailedRoles() map[string]struct{} {
+func (ji *JobInfo) FitFailedRoles(subJob SubJobID) map[string]struct{} {
 	failedRoles := map[string]struct{}{}
 	for tid := range ji.NodesFitErrors {
+		if ji.TaskToSubJob[tid] != subJob {
+			continue
+		}
 		task := ji.Tasks[tid]
 		failedRoles[task.TaskRole] = struct{}{}
 	}
@@ -836,13 +903,13 @@ func (ji *JobInfo) FitFailedRoles() map[string]struct{} {
 }
 
 // TaskHasFitErrors checks if the task has fit errors and can continue try predicating
-func (ji *JobInfo) TaskHasFitErrors(task *TaskInfo) bool {
+func (ji *JobInfo) TaskHasFitErrors(subJob SubJobID, task *TaskInfo) bool {
 	// if the task didn't set the spec key, should not use the cache
 	if len(task.TaskRole) == 0 {
 		return false
 	}
 
-	_, exist := ji.FitFailedRoles()[task.TaskRole]
+	_, exist := ji.FitFailedRoles(subJob)[task.TaskRole]
 	return exist
 }
 
@@ -860,12 +927,23 @@ func (ji *JobInfo) TaskHasFitErrors(task *TaskInfo) bool {
 //
 //	As the failed predicating role has been pre-checked when it was popped from queue,
 //	this function will only be called at most as the number of roles in this job.
-func (ji *JobInfo) NeedContinueAllocating() bool {
+func (ji *JobInfo) NeedContinueAllocating(subJobID SubJobID) bool {
 	// Ensures all tasks must be running; if any pod allocation fails, further execution stops
 	if int(ji.MinAvailable) == len(ji.Tasks) {
 		return false
 	}
-	failedRoles := ji.FitFailedRoles()
+	if subJob, found := ji.SubJobs[subJobID]; found {
+		if int(subJob.MinAvailable) >= len(subJob.Tasks) {
+			return false
+		}
+	}
+
+	// todo: job contains subJob policy does not supports the strategies below
+	if ji.ContainsSubJobPolicy() {
+		return true
+	}
+
+	failedRoles := ji.FitFailedRoles(subJobID)
 
 	pending := map[string]int32{}
 	for _, task := range ji.TaskStatusIndex[Pending] {
@@ -1042,6 +1120,64 @@ func (ji *JobInfo) ValidTaskNum() int32 {
 	return int32(occupied)
 }
 
+func (ji *JobInfo) CheckSubJobValid() bool {
+	subJobs := map[SubJobGID]int32{}
+	for _, subJob := range ji.SubJobs {
+		if _, ok := subJobs[subJob.GID]; !ok {
+			subJobs[subJob.GID] = 0
+		}
+		subJobs[subJob.GID]++
+	}
+	for subJobGID, minSubJobs := range ji.MinSubJobs {
+		if subJobs[subJobGID] < minSubJobs {
+			return false
+		}
+	}
+	return true
+}
+
+func (ji *JobInfo) checkSubJobCondition(condition subJobCondition) error {
+	allocatedSubJobs := map[SubJobGID]int32{}
+	for _, subJob := range ji.SubJobs {
+		if _, ok := allocatedSubJobs[subJob.GID]; !ok {
+			allocatedSubJobs[subJob.GID] = 0
+		}
+		if condition(subJob) {
+			allocatedSubJobs[subJob.GID]++
+		}
+	}
+	for subJobGID, minSubJobs := range ji.MinSubJobs {
+		if minSubJobs == 0 {
+			continue
+		}
+		if allocatedSubJobs[subJobGID] < minSubJobs {
+			return fmt.Errorf("the number of allocated subGroups %d is less than the number of subGroups %d with the minSubGroups attribute in subGroupPolicy %s.",
+				allocatedSubJobs[subJobGID], minSubJobs, subJobGID)
+		}
+	}
+	return nil
+}
+
+func (ji *JobInfo) CheckSubJobReady() bool {
+	if err := ji.checkSubJobCondition(func(subJob *SubJobInfo) bool {
+		return subJob.IsReady()
+	}); err != nil {
+		klog.V(4).Infof("Job %s/%s SubJob not ready, reason: %v", ji.Namespace, ji.Name, err.Error())
+		return false
+	}
+	return true
+}
+
+func (ji *JobInfo) CheckSubJobPipelined() bool {
+	if err := ji.checkSubJobCondition(func(subJob *SubJobInfo) bool {
+		return subJob.IsPipelined()
+	}); err != nil {
+		klog.V(4).Infof("Job %s/%s SubJob not pipelined, reason: %v", ji.Namespace, ji.Name, err.Error())
+		return false
+	}
+	return true
+}
+
 func (ji *JobInfo) IsReady() bool {
 	return ji.ReadyTaskNum()+ji.PendingBestEffortTaskNum() >= ji.MinAvailable
 }
@@ -1083,15 +1219,129 @@ func (ji *JobInfo) IsSoftTopologyMode() bool {
 	return ji.PodGroup.Spec.NetworkTopology.Mode == scheduling.SoftNetworkTopologyMode
 }
 
-func (ji *JobInfo) HasTopologyConstrain() bool {
-	if ji.PodGroup == nil || ji.PodGroup.Spec.NetworkTopology == nil {
-		return false
-	}
-	return true
+// WithNetworkTopology returns whether the job has configured network topologies
+func (ji *JobInfo) WithNetworkTopology() bool {
+	return ji.PodGroup != nil && ji.PodGroup.Spec.NetworkTopology != nil
 }
 
 // ResetFitErr will set job and node fit err to nil.
 func (ji *JobInfo) ResetFitErr() {
 	ji.JobFitErrors = ""
 	ji.NodesFitErrors = make(map[TaskID]*FitErrors)
+}
+
+// ResetSubJobFitErr will set subJob's node fit err to nil.
+func (ji *JobInfo) ResetSubJobFitErr(subJob SubJobID) {
+	maps.DeleteFunc(ji.NodesFitErrors, func(taskID TaskID, _ *FitErrors) bool {
+		return ji.TaskToSubJob[taskID] == subJob
+	})
+}
+
+func (ji *JobInfo) DefaultSubJobGID() SubJobGID {
+	return SubJobGID(ji.UID)
+}
+
+func (ji *JobInfo) DefaultSubJobID() SubJobID {
+	return SubJobID(ji.UID)
+}
+
+func (ji *JobInfo) getOrCreateDefaultSubJob() *SubJobInfo {
+	defaultSubJobGID := ji.DefaultSubJobGID()
+	defaultSubJob := ji.DefaultSubJobID()
+	if _, found := ji.SubJobs[defaultSubJob]; !found {
+		policy := &scheduling.SubGroupPolicySpec{}
+		if !ji.ContainsSubJobPolicy() {
+			policy.SubGroupSize = ptr.To(ji.MinAvailable)
+		}
+		if ji.PodGroup != nil && ji.PodGroup.Spec.NetworkTopology != nil {
+			policy.NetworkTopology = ji.PodGroup.Spec.NetworkTopology.DeepCopy()
+		}
+		ji.SubJobs[defaultSubJob] = NewSubJobInfo(defaultSubJobGID, defaultSubJob, ji.UID, policy, nil)
+	}
+	return ji.SubJobs[defaultSubJob]
+}
+
+func (ji *JobInfo) getOrCreateSubJob(ti *TaskInfo) *SubJobInfo {
+	if ji.PodGroup == nil {
+		return ji.getOrCreateDefaultSubJob()
+	}
+
+	for _, policy := range ji.PodGroup.Spec.SubGroupPolicy {
+		if matchValues := getSubJobMatchValues(policy, ti.Pod); len(matchValues) > 0 {
+			groupID := getSubJobGID(ji.UID, policy.Name)
+			subJobID := getSubJobID(ji.UID, policy.Name, matchValues)
+			if _, found := ji.SubJobs[subJobID]; !found {
+				ji.SubJobs[subJobID] = NewSubJobInfo(groupID, subJobID, ji.UID, &policy, matchValues)
+			}
+			return ji.SubJobs[subJobID]
+		}
+	}
+
+	return ji.getOrCreateDefaultSubJob()
+}
+
+func (ji *JobInfo) addTaskToSubJob(ti *TaskInfo) {
+	subJob := ji.getOrCreateSubJob(ti)
+	subJob.addTask(ti)
+
+	ji.TaskToSubJob[ti.UID] = subJob.UID
+}
+
+func (ji *JobInfo) deleteTaskFromSubJob(ti *TaskInfo) {
+	subJobID := ji.TaskToSubJob[ti.UID]
+	if subJob, found := ji.SubJobs[subJobID]; found {
+		subJob.deleteTask(ti)
+	}
+
+	delete(ji.TaskToSubJob, ti.UID)
+}
+
+// ContainsSubJobPolicy returns whether the job has any other subJobs besides the virtual default subJob
+func (ji *JobInfo) ContainsSubJobPolicy() bool {
+	if ji.PodGroup == nil {
+		return false
+	}
+	return len(ji.PodGroup.Spec.SubGroupPolicy) > 0
+}
+
+// ContainsHardTopologyInSubJob returns whether the subJobs in the job contain hard network topology
+func (ji *JobInfo) ContainsHardTopologyInSubJob() bool {
+	if ji.PodGroup == nil {
+		return false
+	}
+
+	for _, policy := range ji.PodGroup.Spec.SubGroupPolicy {
+		if policy.NetworkTopology != nil && policy.NetworkTopology.Mode == scheduling.HardNetworkTopologyMode &&
+			policy.NetworkTopology.HighestTierAllowed != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// ContainsHardTopology returns whether the job and the subJobs in the job contain hard network topology
+func (ji *JobInfo) ContainsHardTopology() bool {
+	if hard, _ := ji.IsHardTopologyMode(); hard || ji.ContainsHardTopologyInSubJob() {
+		return true
+	}
+	return false
+}
+
+// ContainsNetworkTopologyInSubJob returns whether the subJobs in the job contain network topology
+func (ji *JobInfo) ContainsNetworkTopologyInSubJob() bool {
+	if ji.PodGroup == nil {
+		return false
+	}
+
+	for _, policy := range ji.PodGroup.Spec.SubGroupPolicy {
+		if policy.NetworkTopology != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// ContainsNetworkTopology returns whether the job and the subJobs in the job contain network topology
+func (ji *JobInfo) ContainsNetworkTopology() bool {
+	return ji.WithNetworkTopology() || ji.ContainsNetworkTopologyInSubJob()
 }

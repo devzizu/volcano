@@ -28,13 +28,13 @@ import (
 	"k8s.io/klog/v2"
 
 	"volcano.sh/volcano/pkg/scheduler/api"
-	"volcano.sh/volcano/pkg/scheduler/api/devices/ascend/ascend310p/vnpu"
+	"volcano.sh/volcano/pkg/scheduler/api/devices/ascend/mindcluster/ascend310p/vnpu"
 	"volcano.sh/volcano/pkg/scheduler/conf"
 	"volcano.sh/volcano/pkg/scheduler/framework"
-	"volcano.sh/volcano/third_party/ascend-for-volcano/common/k8s"
-	"volcano.sh/volcano/third_party/ascend-for-volcano/common/util"
-	"volcano.sh/volcano/third_party/ascend-for-volcano/config"
-	"volcano.sh/volcano/third_party/ascend-for-volcano/plugin"
+	"volcano.sh/volcano/third_party/mindcluster/common/k8s"
+	"volcano.sh/volcano/third_party/mindcluster/common/util"
+	"volcano.sh/volcano/third_party/mindcluster/config"
+	"volcano.sh/volcano/third_party/mindcluster/plugin"
 )
 
 func InitVNPUDevice(device *vnpu.NPUDevices, ssn *framework.Session, nodeInfo *api.NodeInfo) error {
@@ -254,11 +254,6 @@ func initNPUNodeByNodeInf(device *vnpu.NPUDevices, npuNode *api.NodeInfo, device
 }
 
 func setNodeVNPUInfo(device *vnpu.NPUDevices, ni *api.NodeInfo, jobTemplate map[string]map[string]vnpu.VResource) error {
-	device.NPUDevice = vnpu.NPUDevice{
-		Chips:            make(map[int]*vnpu.VChip, util.MapInitNum),
-		UnhealthyChipIds: make(map[int]struct{}),
-	}
-
 	if !checkDyVNodeResourceInitialized(device) {
 		return fmt.Errorf("setNodeVNPUInfo %s: DyVNode resource not initialized", device.NodeInf.Name)
 	}
