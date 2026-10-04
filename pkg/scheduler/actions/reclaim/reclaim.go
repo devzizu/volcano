@@ -178,6 +178,7 @@ func (ra *Action) Execute(ssn *framework.Session) {
 }
 
 func (ra *Action) reclaimForTask(ssn *framework.Session, stmt *framework.Statement, task *api.TaskInfo, job *api.JobInfo) {
+	queue := ssn.Queues[job.Queue]
 	totalNodes := ssn.FilterOutUnschedulableAndUnresolvableNodesForTask(task)
 	predicateHelper := util.NewPredicateHelper()
 	predicateNodes, _ := predicateHelper.PredicateNodes(task, totalNodes, ssn.PredicateForPreemptAction, ra.enablePredicateErrorCache, ssn.NodesInShard)
@@ -246,6 +247,20 @@ func (ra *Action) reclaimForTask(ssn *framework.Session, stmt *framework.Stateme
 		klog.V(3).Infof("Reclaimed <%v> for task <%s/%s> requested <%v>, and Node <%s> availableResources <%v>.", reclaimed, task.Namespace, task.Name, task.InitResreq, n.Name, availableResources)
 
 		if !reclaimerFits {
+			nodeStmt.Discard()
+			continue
+		}
+
+		// reclaimerFits only covers node resources and predicates. Queue capability is
+		// enforced by Allocatable when the task is finally placed, and that check also
+		// counts resources reserved by ungated-but-unscheduled pods, which eviction does
+		// not release. The evictions above already reached the queue accounting through
+		// DeallocateFunc, so asking here reflects the post-eviction state. Without this a
+		// task can be reclaimed for, be refused by Allocatable in a later cycle, and leave
+		// the victims dead for nothing.
+		if queue != nil && !ssn.Allocatable(queue, task) {
+			klog.V(3).Infof("Queue <%s> cannot accommodate Task <%s/%s> after reclaiming on Node <%s>, discarding evictions",
+				queue.Name, task.Namespace, task.Name, n.Name)
 			nodeStmt.Discard()
 			continue
 		}
