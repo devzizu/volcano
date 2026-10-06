@@ -26,8 +26,12 @@ import (
 	v1 "k8s.io/api/core/v1"
 	schedulingv1 "k8s.io/api/scheduling/v1"
 
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+
 	schedulingv1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 	"volcano.sh/volcano/cmd/scheduler/app/options"
+	"volcano.sh/volcano/pkg/features"
 	"volcano.sh/volcano/pkg/scheduler/api"
 	"volcano.sh/volcano/pkg/scheduler/conf"
 	"volcano.sh/volcano/pkg/scheduler/framework"
@@ -466,6 +470,155 @@ func TestReclaimRechecksPredicateAfterEviction(t *testing.T) {
 			{Name: gang.PluginName, EnabledReclaimable: &trueValue, EnabledJobStarving: &trueValue},
 			{Name: proportion.PluginName, EnabledReclaimable: &trueValue, EnabledQueueOrder: &trueValue, EnablePreemptive: &trueValue},
 			{Name: deviceFitAfterReclaimPluginName, EnabledPredicate: &trueValue},
+		},
+	}}
+
+	test.RegisterSession(tiers, nil)
+	defer test.Close()
+	test.Run([]framework.Action{New()})
+	if err := test.CheckAll(0); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestReclaimRespectsGateReservations verifies that reclaim does not evict victims for a
+// task that its own queue cannot accommodate. Queue q2 holds a gate reservation: a pod
+// whose scheduling gate was removed after passing the capacity check, still Pending while
+// it waits for a node. Allocatable counts that reservation, Preemptive does not, so
+// without the post-eviction check reclaim evicts q1's pod for a reclaimer that is then
+// refused, leaving the victim dead for nothing.
+func TestReclaimRespectsGateReservations(t *testing.T) {
+	options.Default()
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.SchedulingGatesQueueAdmission, true)
+
+	// Ungated (no SchedulingGates) but carrying the opt-in annotation, which is how the
+	// capacity plugin recognises an admitted-but-unplaced pod.
+	reserved := util.BuildPod("c1", "reserved", "", v1.PodPending, api.BuildResourceList("2", "2G"), "pg-reserved",
+		make(map[string]string), make(map[string]string))
+	reserved.Annotations[schedulingv1beta1.QueueAllocationGateKey] = "true"
+	// Keep it out of the reclaimer set so the test isolates the reclaimer's behaviour.
+	never := v1.PreemptNever
+	reserved.Spec.PreemptionPolicy = &never
+
+	test := uthelper.TestCommonStruct{
+		Name: "reclaim is refused when the reclaimer's queue is full of gate reservations",
+		Plugins: map[string]framework.PluginBuilder{
+			conformance.PluginName: conformance.New,
+			gang.PluginName:        gang.New,
+			capacity.PluginName:    capacity.New,
+		},
+		PodGroups: []*schedulingv1beta1.PodGroup{
+			util.BuildPodGroup("pg-victim", "c1", "q1", 1, nil, schedulingv1beta1.PodGroupRunning),
+			util.BuildPodGroup("pg-reserved", "c1", "q2", 1, nil, schedulingv1beta1.PodGroupInqueue),
+			util.BuildPodGroup("pg-reclaimer", "c1", "q2", 1, nil, schedulingv1beta1.PodGroupInqueue),
+		},
+		Pods: []*v1.Pod{
+			// q1 fills the node with two preemptable pods, so the reclaimer needs an eviction.
+			// Evicting one leaves q1 at its deserved share, so capacity permits exactly one.
+			util.BuildPod("c1", "victim1", "n1", v1.PodRunning, api.BuildResourceList("1", "1G"), "pg-victim",
+				map[string]string{schedulingv1beta1.PodPreemptable: "true"}, make(map[string]string)),
+			util.BuildPod("c1", "victim2", "n1", v1.PodRunning, api.BuildResourceList("1", "1G"), "pg-victim",
+				map[string]string{schedulingv1beta1.PodPreemptable: "true"}, make(map[string]string)),
+			reserved,
+			util.BuildPod("c1", "reclaimer", "", v1.PodPending, api.BuildResourceList("1", "1G"), "pg-reclaimer",
+				make(map[string]string), make(map[string]string)),
+		},
+		Nodes: []*v1.Node{
+			util.BuildNode("n1", api.BuildResourceList("2", "2G", []api.ScalarResource{{Name: "pods", Value: "10"}}...), make(map[string]string)),
+		},
+		Queues: []*schedulingv1beta1.Queue{
+			// q1 is over its deserved share, so one of its pods is reclaimable.
+			util.BuildQueueWithResourcesQuantity("q1", api.BuildResourceList("0", "0G"), api.BuildResourceList("2", "2G")),
+			// q2 can hold 2 CPU. The reservation takes all of it, so the 1 CPU reclaimer
+			// does not fit: allocated 0 + reserved 2 + request 1 = 3 > 2. Preemptive sees
+			// only allocated 0 + 1 = 1 and would wave the eviction through.
+			util.BuildQueueWithResourcesQuantity("q2", api.BuildResourceList("2", "2G"), api.BuildResourceList("2", "2G")),
+		},
+		ExpectEvictNum: 0,
+		ExpectEvicted:  []string{},
+	}
+
+	trueValue := true
+	tiers := []conf.Tier{{
+		Plugins: []conf.PluginOption{
+			{Name: conformance.PluginName, EnabledReclaimable: &trueValue},
+			{Name: gang.PluginName, EnabledReclaimable: &trueValue, EnabledJobStarving: &trueValue},
+			{Name: capacity.PluginName, EnabledReclaimable: &trueValue, EnabledQueueOrder: &trueValue,
+				EnablePreemptive: &trueValue, EnabledAllocatable: &trueValue},
+		},
+	}}
+
+	test.RegisterSession(tiers, nil)
+	defer test.Close()
+	test.Run([]framework.Action{New()})
+	if err := test.CheckAll(0); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestReclaimWithAnnotatedVictim guards the interaction between eviction and the reserved
+// cache. The queue allocation gate annotation persists on running pods, so a victim can
+// carry it. Evicting such a victim fires DeallocateFunc, which re-adds it to the reserved
+// cache, and the post-eviction Allocatable check must not then read that re-add as the
+// capacity still being occupied: the reclaim is legitimate and must go ahead.
+func TestReclaimWithAnnotatedVictim(t *testing.T) {
+	options.Default()
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.SchedulingGatesQueueAdmission, true)
+
+	// Running victims that opted into the gate feature; the annotation outlives scheduling.
+	victim1 := util.BuildPod("c1", "victim1", "n1", v1.PodRunning, api.BuildResourceList("1", "1G"), "pg-victim",
+		map[string]string{schedulingv1beta1.PodPreemptable: "true"}, make(map[string]string))
+	victim1.Annotations[schedulingv1beta1.QueueAllocationGateKey] = "true"
+	// Not preemptable, so victim1 is the only candidate and the choice is deterministic.
+	// It still occupies the node, forcing the reclaimer to need an eviction.
+	victim2 := util.BuildPod("c1", "victim2", "n1", v1.PodRunning, api.BuildResourceList("1", "1G"), "pg-victim",
+		map[string]string{schedulingv1beta1.PodPreemptable: "false"}, make(map[string]string))
+
+	// q1 and q2 share parent P, so the reserved re-add on eviction propagates into the
+	// ancestor the reclaimer is also checked against.
+	withParent := func(q *schedulingv1beta1.Queue, p string) *schedulingv1beta1.Queue {
+		q.Spec.Parent = p
+		return q
+	}
+	root := withParent(util.BuildQueueWithResourcesQuantity("root", nil, nil), "")
+	parent := withParent(util.BuildQueueWithResourcesQuantity("p", api.BuildResourceList("2", "2G"), api.BuildResourceList("2", "2G")), "root")
+	q1 := withParent(util.BuildQueueWithResourcesQuantity("q1", api.BuildResourceList("0", "0G"), api.BuildResourceList("2", "2G")), "p")
+	q2 := withParent(util.BuildQueueWithResourcesQuantity("q2", api.BuildResourceList("2", "2G"), api.BuildResourceList("2", "2G")), "p")
+
+	test := uthelper.TestCommonStruct{
+		Name: "reclaim proceeds when the victim carries the gate annotation",
+		Plugins: map[string]framework.PluginBuilder{
+			conformance.PluginName: conformance.New,
+			gang.PluginName:        gang.New,
+			capacity.PluginName:    capacity.New,
+		},
+		PodGroups: []*schedulingv1beta1.PodGroup{
+			util.BuildPodGroup("pg-victim", "c1", "q1", 1, nil, schedulingv1beta1.PodGroupRunning),
+			util.BuildPodGroup("pg-reclaimer", "c1", "q2", 1, nil, schedulingv1beta1.PodGroupInqueue),
+		},
+		Pods: []*v1.Pod{
+			victim1,
+			victim2,
+			util.BuildPod("c1", "reclaimer", "", v1.PodPending, api.BuildResourceList("1", "1G"), "pg-reclaimer",
+				make(map[string]string), make(map[string]string)),
+		},
+		Nodes: []*v1.Node{
+			util.BuildNode("n1", api.BuildResourceList("2", "2G", []api.ScalarResource{{Name: "pods", Value: "10"}}...), make(map[string]string)),
+		},
+		Queues: []*schedulingv1beta1.Queue{
+			root, parent, q1, q2,
+		},
+		ExpectEvictNum: 1,
+		ExpectEvicted:  []string{"c1/victim1"},
+	}
+
+	trueValue := true
+	tiers := []conf.Tier{{
+		Plugins: []conf.PluginOption{
+			{Name: conformance.PluginName, EnabledReclaimable: &trueValue},
+			{Name: gang.PluginName, EnabledReclaimable: &trueValue, EnabledJobStarving: &trueValue},
+			{Name: capacity.PluginName, EnabledReclaimable: &trueValue, EnabledQueueOrder: &trueValue,
+				EnablePreemptive: &trueValue, EnabledAllocatable: &trueValue, EnabledHierarchy: &trueValue},
 		},
 	}}
 

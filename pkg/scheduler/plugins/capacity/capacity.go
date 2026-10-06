@@ -1013,8 +1013,12 @@ func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 			klog.V(4).Infof("[capacity] DeallocateFunc: task <%v/%v>, resreq <%v>, share <%v>",
 				event.Task.Namespace, event.Task.Name, event.Task.Resreq, attr.share)
 
-			// Restore task to reserved cache on rollback so capacity remains accounted for
+			// Restore task to reserved cache on rollback so capacity remains accounted for.
+			// A rollback returns the task to Pending, which is what a reservation is. Eviction
+			// reaches this handler too, but sets Releasing: that task was running and held no
+			// reservation, so re-adding one would claim capacity nothing is waiting for.
 			if utilfeature.DefaultFeatureGate.Enabled(features.SchedulingGatesQueueAdmission) &&
+				event.Task.Status == api.Pending &&
 				api.HasQueueAllocationGateAnnotation(event.Task.Pod) {
 				cp.addTaskToReservedCache(job.Queue, event.Task)
 			}
