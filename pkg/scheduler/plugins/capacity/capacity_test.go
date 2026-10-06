@@ -1781,7 +1781,7 @@ func TestSharedResourceClaimIsChargedOnce(t *testing.T) {
 	}
 
 	queue := &api.QueueInfo{UID: queueID, Name: "q1"}
-	if !cp.queueAllocatable(queue, taskA, true, false) {
+	if !cp.queueAllocatable(queue, taskA, true, false, false) {
 		t.Fatalf("shared claim should not consume additional DRA quota when the claim is already referenced by the queue")
 	}
 
@@ -1798,7 +1798,7 @@ func TestSharedResourceClaimIsChargedOnce(t *testing.T) {
 			"gpu.com": {Count: 1},
 		},
 	}
-	if cp.queueAllocatable(queue, distinctTask, true, false) {
+	if cp.queueAllocatable(queue, distinctTask, true, false, false) {
 		t.Fatalf("distinct claim should still be rejected when it exceeds remaining DRA quota")
 	}
 
